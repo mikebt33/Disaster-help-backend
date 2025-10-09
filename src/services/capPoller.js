@@ -196,8 +196,12 @@ async function fetchCapFeed(feed) {
 }
 
 /** Run all feeds */
-export async function pollCapFeeds() {
+async function pollCapFeeds() {
   console.log("🚨 CAP Poller running...");
   for (const feed of CAP_FEEDS) await fetchCapFeed(feed);
   console.log("✅ CAP poll cycle complete.\n");
 }
+
+export { pollCapFeeds };
+
+
