@@ -159,35 +159,8 @@ function normalizeCapAlert(entry, source) {
   }
 }
 
-/** Save CAP alerts and mirror to hazards */
-async function saveAlerts(alerts) {
-  const db = getDB();
-  const alertsCol = db.collection("alerts_cap");
-  const hazardsCol = db.collection("hazards");
-
-  for (const alert of alerts) {
-    if (!alert.identifier) continue;
-    await alertsCol.updateOne({ identifier: alert.identifier }, { $set: alert }, { upsert: true });
-
-    if (alert.geometry) {
-      await hazardsCol.updateOne(
-        { "geometry.coordinates": alert.geometry.coordinates },
-        {
-          $set: {
-            type: alert.info.event || "Alert",
-            description: alert.info.description || "",
-            severity: alert.info.severity,
-            source: alert.source,
-            geometry: alert.geometry,
-            bbox: alert.bbox,
-            timestamp: new Date(),
-          },
-        },
-        { upsert: true }
-      );
-    }
-  }
-}
+// We no longer mirror CAP alerts into hazards to avoid map duplication.
+// CAP alerts are handled independently in their own collection.
 
 /** Fetch and process a feed */
 async function fetchCapFeed(feed) {
