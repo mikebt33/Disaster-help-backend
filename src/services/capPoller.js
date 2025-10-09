@@ -63,23 +63,42 @@ function polygonCentroid(geometry) {
 function normalizeCapAlert(entry, source) {
   try {
     const info = Array.isArray(entry.info) ? entry.info[0] : entry.info;
-    const area = info?.area || {};
-    const polygon = area?.polygon || info?.polygon;
-    const circle = area?.circle;
-    const polygonGeom = parsePolygon(polygon);
+    const area = Array.isArray(info?.area) ? info.area[0] : info?.area || {};
+
+    // Normalize possible polygon formats (list, string, or namespaced key)
+    const polygonField =
+      area?.polygon ||
+      area?.["cap:polygon"] ||
+      info?.polygon ||
+      info?.["cap:polygon"] ||
+      (Array.isArray(area?.polygons) ? area.polygons[0] : null);
+    const circleField =
+      area?.circle ||
+      area?.["cap:circle"] ||
+      info?.circle ||
+      info?.["cap:circle"];
+
+    // Parse polygon string
+    const polygonGeom = parsePolygon(
+      Array.isArray(polygonField) ? polygonField.join(" ") : polygonField
+    );
+
     let geometry = polygonGeom ? polygonCentroid(polygonGeom) : null;
 
-    // Parse <circle> format "lat,lon radius"
-    if (!geometry && circle) {
-      const [lat, lon] = circle.split(/[ ,]/).map(parseFloat);
-      if (!isNaN(lat) && !isNaN(lon)) geometry = { type: "Point", coordinates: [lon, lat] };
+    // Try to extract <circle> like "37.25,-80.10 50"
+    if (!geometry && circleField) {
+      const parts = circleField.split(/[ ,]/).map(parseFloat);
+      if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+        geometry = { type: "Point", coordinates: [parts[1], parts[0]] };
+      }
     }
 
-    // Fallback to explicit lat/lon
-    const lat = parseFloat(info?.lat || area?.lat || info?.latitude);
-    const lon = parseFloat(info?.lon || area?.lon || info?.longitude);
-    if (!geometry && !isNaN(lat) && !isNaN(lon))
+    // Fallback to lat/lon in area or info
+    const lat = parseFloat(info?.lat || info?.latitude || area?.lat);
+    const lon = parseFloat(info?.lon || info?.longitude || area?.lon);
+    if (!geometry && !isNaN(lat) && !isNaN(lon)) {
       geometry = { type: "Point", coordinates: [lon, lat] };
+    }
 
     return {
       identifier: entry.identifier || entry.id || `UNKNOWN-${Date.now()}`,
@@ -100,8 +119,8 @@ function normalizeCapAlert(entry, source) {
       },
       area: {
         areaDesc: area?.areaDesc || info?.areaDesc || "",
-        polygon: polygon || null,
-        circle: circle || null,
+        polygon: polygonField || null,
+        circle: circleField || null,
       },
       geometry,
       source,
