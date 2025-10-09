@@ -65,27 +65,38 @@ function normalizeCapAlert(entry, source) {
     const info = Array.isArray(entry.info) ? entry.info[0] : entry.info;
     const area = Array.isArray(info?.area) ? info.area[0] : info?.area || {};
 
-    // Normalize possible polygon formats (list, string, or namespaced key)
-    const polygonField =
+    // Normalize polygon (string, array, namespaced)
+    let polygonRaw =
       area?.polygon ||
       area?.["cap:polygon"] ||
       info?.polygon ||
-      info?.["cap:polygon"] ||
-      (Array.isArray(area?.polygons) ? area.polygons[0] : null);
+      info?.["cap:polygon"];
+    if (Array.isArray(polygonRaw)) polygonRaw = polygonRaw.join(" ");
+
+    // Handle multiple polygons in a string
+    const polygonGeom = parsePolygon(polygonRaw);
+    let geometry = polygonGeom ? polygonCentroid(polygonGeom) : null;
+
+    // Derive bounding box if polygon available
+    let bbox = null;
+    if (polygonGeom && polygonGeom.coordinates?.[0]?.length >= 3) {
+      const pts = polygonGeom.coordinates[0];
+      const lats = pts.map((p) => p[1]);
+      const lons = pts.map((p) => p[0]);
+      bbox = [
+        Math.min(...lons),
+        Math.min(...lats),
+        Math.max(...lons),
+        Math.max(...lats),
+      ];
+    }
+
+    // Parse <circle> like "37.25,-80.10 50"
     const circleField =
       area?.circle ||
       area?.["cap:circle"] ||
       info?.circle ||
       info?.["cap:circle"];
-
-    // Parse polygon string
-    const polygonGeom = parsePolygon(
-      Array.isArray(polygonField) ? polygonField.join(" ") : polygonField
-    );
-
-    let geometry = polygonGeom ? polygonCentroid(polygonGeom) : null;
-
-    // Try to extract <circle> like "37.25,-80.10 50"
     if (!geometry && circleField) {
       const parts = circleField.split(/[ ,]/).map(parseFloat);
       if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
@@ -93,9 +104,9 @@ function normalizeCapAlert(entry, source) {
       }
     }
 
-    // Fallback to lat/lon in area or info
-    const lat = parseFloat(info?.lat || info?.latitude || area?.lat);
-    const lon = parseFloat(info?.lon || info?.longitude || area?.lon);
+    // Fallback lat/lon
+    const lat = parseFloat(info?.lat || area?.lat || info?.latitude);
+    const lon = parseFloat(info?.lon || area?.lon || info?.longitude);
     if (!geometry && !isNaN(lat) && !isNaN(lon)) {
       geometry = { type: "Point", coordinates: [lon, lat] };
     }
@@ -119,10 +130,11 @@ function normalizeCapAlert(entry, source) {
       },
       area: {
         areaDesc: area?.areaDesc || info?.areaDesc || "",
-        polygon: polygonField || null,
+        polygon: polygonRaw || null,
         circle: circleField || null,
       },
       geometry,
+      bbox, // ✅ new bounding box field
       source,
       timestamp: new Date(),
     };
