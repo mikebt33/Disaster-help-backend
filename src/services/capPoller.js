@@ -126,38 +126,52 @@ function normalizeCapAlert(entry, source) {
       bbox = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
     }
 
-    return {
-      identifier: root.identifier || root.id || `UNKNOWN-${Date.now()}`,
-      sender: root.sender || "",
-      sent: info?.effective || root.sent || new Date().toISOString(),
-      status: root.status || "Actual",
-      msgType: root.msgType || "Alert",
-      scope: root.scope || "Public",
-      info: {
-        category: info?.category || "General",
-        event: info?.event || "Alert",
-        urgency: info?.urgency || "Unknown",
-        severity: info?.severity || "Unknown",
-        certainty: info?.certainty || "Unknown",
-        headline: info?.headline || "",
-        description: info?.description || "",
-        instruction: info?.instruction || "",
-      },
-      area: {
-        areaDesc: area?.areaDesc || info?.areaDesc || "",
-        polygon: polygonRaw || null,
-      },
-      geometry,
-      bbox,
-      hasGeometry: !!geometry,
-      source,
-      timestamp: new Date(),
-    };
-  } catch (err) {
-    console.error("⚠️ Error normalizing CAP alert:", err.message);
-    return null;
-  }
-}
+       return {
+         identifier: root.identifier || root.id || `UNKNOWN-${Date.now()}`,
+         sender: root.sender || "",
+         sent: info?.effective || root.sent || new Date().toISOString(),
+         status: root.status || "Actual",
+         msgType: root.msgType || "Alert",
+         scope: root.scope || "Public",
+         info: {
+           category: info?.category || "General",
+           event: info?.event || root.event || "Alert",
+           urgency: info?.urgency || "Unknown",
+           severity: info?.severity || "Unknown",
+           certainty: info?.certainty || "Unknown",
+           headline:
+             info?.headline ||
+             root.title ||
+             "",
+           description:
+             info?.description ||
+             root.summary ||
+             root.content ||
+             "",
+           instruction: info?.instruction || "",
+         },
+         area: {
+           areaDesc:
+             area?.areaDesc ||
+             info?.areaDesc ||
+             root.areaDesc ||
+             "",
+           polygon: polygonRaw || null,
+         },
+         // 🌍 Geometry fallback: polygon centroid, explicit lat/lon, or bbox center
+         geometry,
+         bbox,
+         hasGeometry: !!geometry,
+         // 👇 Add user-facing text for front-end
+         title: root.title || info?.headline || info?.event || "CAP Alert",
+         summary:
+           root.summary ||
+           info?.description ||
+           info?.headline ||
+           "",
+         source,
+         timestamp: new Date(),
+       };
 
 // We no longer mirror CAP alerts into hazards to avoid map duplication.
 // CAP alerts are handled independently in their own collection.
