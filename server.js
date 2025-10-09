@@ -2,17 +2,15 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import cron from "node-cron";
-import { connectDB } from "./db.js";
-import { runCleanup } from "./services/cleanupService.js";
+import { connectDB } from "./src/db.js";
+import { runCleanup } from "./src/services/cleanupService.js";
+import { pollCapFeeds } from "./src/services/capPoller.js";
+import helpRoutes from "./src/routes/helpRequests.js";
+import offerRoutes from "./src/routes/offers.js";
+import hazardRoutes from "./src/routes/hazards.js";
+import alertRoutes from "./src/routes/alertsCap.js";
 
-// API routes
-import helpRoutes from "./routes/helpRequests.js";
-import offerRoutes from "./routes/offers.js";
-import hazardRoutes from "./routes/hazards.js";
-import alertRoutes from "./routes/alertsCap.js";
 
-// CAP Poller service
-import { pollCapFeeds } from "./services/capPoller.js";
 
 
 dotenv.config();
