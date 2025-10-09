@@ -5,7 +5,7 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node --input-type=module server.js"
+    "start": "node src/server.js"
   },
   "engines": {
     "node": "22.x"
