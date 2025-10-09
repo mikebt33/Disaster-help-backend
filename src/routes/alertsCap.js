@@ -5,14 +5,19 @@ const router = express.Router();
 
 /**
  * GET /api/alerts-cap
- * List recent CAP alerts (limit 50)
+ * Returns recent CAP alerts that have valid geometry
  */
 router.get("/", async (req, res) => {
   try {
     const db = getDB();
     const alerts = db.collection("alerts_cap");
 
-    const recent = await alerts.find({}).sort({ sent: -1 }).limit(50).toArray();
+    // ✅ Only fetch alerts that have a geometry field
+    const recent = await alerts
+      .find({ geometry: { $ne: null } })
+      .sort({ sent: -1 })
+      .limit(200)
+      .toArray();
 
     res.json({
       count: recent.length,
@@ -23,6 +28,7 @@ router.get("/", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch CAP alerts." });
   }
 });
+
 
 /**
  * GET /api/alerts-cap/:id
