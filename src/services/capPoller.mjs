@@ -4,7 +4,7 @@ import { getDB } from "../db.js";
 
 /**
  * CAP Alert Poller Service — universal NWS / FEMA / USGS
- * Ensures all alerts have geometry (polygon centroid, lat/lon, or fallback)
+ * Fetches CAP feeds, normalizes data, ensures geometry, and stores in MongoDB.
  */
 
 const CAP_FEEDS = [
@@ -126,55 +126,60 @@ function normalizeCapAlert(entry, source) {
       bbox = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
     }
 
-       return {
-         identifier: root.identifier || root.id || `UNKNOWN-${Date.now()}`,
-         sender: root.sender || "",
-         sent: info?.effective || root.sent || new Date().toISOString(),
-         status: root.status || "Actual",
-         msgType: root.msgType || "Alert",
-         scope: root.scope || "Public",
-         info: {
-           category: info?.category || "General",
-           event: info?.event || root.event || "Alert",
-           urgency: info?.urgency || "Unknown",
-           severity: info?.severity || "Unknown",
-           certainty: info?.certainty || "Unknown",
-           headline:
-             info?.headline ||
-             root.title ||
-             "",
-           description:
-             info?.description ||
-             root.summary ||
-             root.content ||
-             "",
-           instruction: info?.instruction || "",
-         },
-         area: {
-           areaDesc:
-             area?.areaDesc ||
-             info?.areaDesc ||
-             root.areaDesc ||
-             "",
-           polygon: polygonRaw || null,
-         },
-         // 🌍 Geometry fallback: polygon centroid, explicit lat/lon, or bbox center
-         geometry,
-         bbox,
-         hasGeometry: !!geometry,
-         // 👇 Add user-facing text for front-end
-         title: root.title || info?.headline || info?.event || "CAP Alert",
-         summary:
-           root.summary ||
-           info?.description ||
-           info?.headline ||
-           "",
-         source,
-         timestamp: new Date(),
-       };
+    return {
+      identifier: root.identifier || root.id || `UNKNOWN-${Date.now()}`,
+      sender: root.sender || "",
+      sent: info?.effective || root.sent || new Date().toISOString(),
+      status: root.status || "Actual",
+      msgType: root.msgType || "Alert",
+      scope: root.scope || "Public",
+      info: {
+        category: info?.category || "General",
+        event: info?.event || root.event || "Alert",
+        urgency: info?.urgency || "Unknown",
+        severity: info?.severity || "Unknown",
+        certainty: info?.certainty || "Unknown",
+        headline: info?.headline || root.title || "",
+        description: info?.description || root.summary || root.content || "",
+        instruction: info?.instruction || "",
+      },
+      area: {
+        areaDesc: area?.areaDesc || info?.areaDesc || root.areaDesc || "",
+        polygon: polygonRaw || null,
+      },
+      geometry,
+      bbox,
+      hasGeometry: !!geometry,
+      title: root.title || info?.headline || info?.event || "CAP Alert",
+      summary: root.summary || info?.description || info?.headline || "",
+      source,
+      timestamp: new Date(),
+    };
+  } catch (err) {
+    console.error("❌ Error normalizing CAP alert:", err.message);
+    return null;
+  }
+}
 
-// We no longer mirror CAP alerts into hazards to avoid map duplication.
-// CAP alerts are handled independently in their own collection.
+/** Save parsed alerts into MongoDB */
+async function saveAlerts(alerts) {
+  try {
+    const db = getDB();
+    const collection = db.collection("alerts_cap");
+
+    for (const alert of alerts) {
+      await collection.updateOne(
+        { identifier: alert.identifier },
+        { $set: alert },
+        { upsert: true }
+      );
+    }
+
+    console.log(`💾 Saved ${alerts.length} alerts to MongoDB`);
+  } catch (err) {
+    console.error("❌ Error saving alerts:", err.message);
+  }
+}
 
 /** Fetch and process a feed */
 async function fetchCapFeed(feed) {
@@ -184,11 +189,15 @@ async function fetchCapFeed(feed) {
     const xml = res.data;
     const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true });
     const json = parser.parse(xml);
-    const entries = json.alert ? [json.alert] : json.feed?.entry || [];
+
+    let entries = json.alert ? [json.alert] : json.feed?.entry || [];
+    if (!Array.isArray(entries)) entries = [entries]; // guard single entry
+
     const alerts = entries.map((e) => normalizeCapAlert(e, feed.source)).filter(Boolean);
 
     const withGeom = alerts.filter((a) => a.geometry).length;
     console.log(`✅ Parsed ${alerts.length} alerts from ${feed.source} (${withGeom} with geometry)`);
+
     if (alerts.length) await saveAlerts(alerts);
   } catch (err) {
     console.error(`❌ Error fetching ${feed.name}:`, err.message);
@@ -203,5 +212,3 @@ async function pollCapFeeds() {
 }
 
 export { pollCapFeeds };
-
-
