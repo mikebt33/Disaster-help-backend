@@ -1,8 +1,8 @@
 import express from "express";
 import { getDB } from "../db.js";
 import { ObjectId } from "mongodb";
-import { notifyFollowers } from "../services/notifications.js";
-import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js"; // ✅ new helper for geofence alerts
+import { notifyFollowers, notifyFollowersOfUpdate } from "../services/notifications.js";
+import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js";
 
 const router = express.Router();
 
@@ -34,14 +34,14 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
-      followers: user_id ? [user_id] : [], // auto-follow creator
+      followers: user_id ? [user_id] : [], // ✅ auto-follow creator
       votes: {},
       timestamp: new Date(),
     };
 
     const result = await hazards.insertOne(doc);
 
-    // ✅ Fire geo-notifications asynchronously
+    // ✅ Geo-based push notifications
     setImmediate(async () => {
       try {
         await notifyNearbyUsers("hazards", { ...doc, _id: result.insertedId });
@@ -128,7 +128,6 @@ router.get("/:id", async (req, res) => {
 
 /**
  * PATCH /api/hazards/:id/confirm
- * ✅ Triggers notifications to followers (no geo filter)
  */
 router.patch("/:id/confirm", async (req, res) => {
   try {
@@ -161,9 +160,9 @@ router.patch("/:id/confirm", async (req, res) => {
 
     await hazards.updateOne(query, update);
 
-    // ✅ Notify followers (no geofence)
+    // ✅ Notify followers of update
     setImmediate(() =>
-      notifyFollowers("hazards", id, "Hazard confirmed", doc.description || "A hazard was confirmed.")
+      notifyFollowersOfUpdate("hazards", id, user_id, "confirm", "A hazard was confirmed.")
     );
 
     res.json({ message: "Confirm recorded." });
@@ -207,9 +206,9 @@ router.patch("/:id/dispute", async (req, res) => {
 
     await hazards.updateOne(query, update);
 
-    // ✅ Notify followers (no geofence)
+    // ✅ Notify followers of update
     setImmediate(() =>
-      notifyFollowers("hazards", id, "Hazard disputed", doc.description || "A hazard was disputed.")
+      notifyFollowersOfUpdate("hazards", id, user_id, "dispute", "A hazard was disputed.")
     );
 
     res.json({ message: "Dispute recorded." });
@@ -236,9 +235,9 @@ router.patch("/:id/resolve", async (req, res) => {
     if (result.matchedCount === 0)
       return res.status(404).json({ error: "Hazard not found." });
 
-    // ✅ Notify followers
+    // ✅ Notify followers of resolve event
     setImmediate(() =>
-      notifyFollowers("hazards", id, "Hazard resolved", "A followed hazard has been marked as resolved.")
+      notifyFollowersOfUpdate("hazards", id, null, "resolve", "A followed hazard has been marked as resolved.")
     );
 
     res.json({ message: "Hazard resolved." });
@@ -286,7 +285,6 @@ router.patch("/:id/follow", async (req, res) => {
 
 /**
  * POST /api/hazards/:id/comments
- * ✅ Notifies followers about new updates/comments
  */
 router.post("/:id/comments", async (req, res) => {
   try {
@@ -312,14 +310,9 @@ router.post("/:id/comments", async (req, res) => {
 
     const result = await comments.insertOne(comment);
 
-    // ✅ Notify followers about update
+    // ✅ Notify followers of comment/update
     setImmediate(() =>
-      notifyFollowers(
-        "hazards",
-        id,
-        "New update on a hazard you follow",
-        text || "A new comment was posted."
-      )
+      notifyFollowersOfUpdate("hazards", id, user_id, "comment", text)
     );
 
     res.status(201).json({ id: result.insertedId.toString(), ...comment });
@@ -359,7 +352,9 @@ router.delete("/:id", async (req, res) => {
     const hazards = db.collection("hazards");
     const { id } = req.params;
     const query =
-      /^[0-9a-fA-F]{24}$/.test(id) ? { _id: new ObjectId(id) } : { _id: id };
+      /^[0-9a-fA-F]{24}$/.test(id)
+        ? { _id: new ObjectId(id) }
+        : { _id: id };
     const result = await hazards.deleteOne(query);
     if (result.deletedCount === 0)
       return res

@@ -7,7 +7,8 @@
  * Responsibilities:
  *   ✅ Use shared Firebase Admin instance (via firebaseAdmin.js)
  *   ✅ Register user FCM tokens
- *   ✅ Send notifications to followers of a post WITH geofence filtering
+ *   ✅ Send notifications to followers of a post (geo-filtered)
+ *   ✅ Notify followers of updates (comments, resolves, etc.)
  *   ✅ Clean up invalid tokens automatically
  * -------------------------------------------------------------
  */
@@ -20,10 +21,6 @@ import { haversineDistanceMi } from "../utils/geoUtils.js"; // ✅ distance help
 // 🔖 Register a user’s FCM token
 // =============================================================
 
-/**
- * Save or update a user’s FCM token.
- * Creates user record if missing.
- */
 export async function registerFcmToken(userId, token) {
   if (!userId || !token) {
     console.warn("⚠️ Missing userId or token in registerFcmToken");
@@ -55,18 +52,6 @@ export async function registerFcmToken(userId, token) {
 // 📣 Send notifications to followers (geo-filtered)
 // =============================================================
 
-/**
- * Notify all followers of a post (help, offer, or hazard),
- * but only if the event is within their configured radiusMi.
- *
- * Each follower document must contain:
- *   {
- *     user_id,
- *     fcm_tokens: [ ... ],
- *     lastLocation: { lat, lng },
- *     radiusMi: number
- *   }
- */
 export async function notifyFollowers(collection, docId, title, body, data = {}) {
   try {
     const db = getDB();
@@ -84,7 +69,7 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
       return;
     }
 
-    // 🔍 Determine event location (hazards.geometry / help_requests.location)
+    // 🔍 Determine event location
     let eventLat = 0, eventLng = 0;
     if (post.geometry?.coordinates?.length >= 2) {
       [eventLng, eventLat] = post.geometry.coordinates;
@@ -94,7 +79,7 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
       console.warn("⚠️ Event has no valid location geometry, skipping geo filter.");
     }
 
-    // 🔎 Get all follower user profiles
+    // 🔎 Fetch follower profiles
     const users = db.collection("users");
     const followerDocs = await users
       .find({ user_id: { $in: followerIds } })
@@ -105,7 +90,6 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
     for (const u of followerDocs) {
       if (!u.fcm_tokens?.length || !u.lastLocation || !u.radiusMi) continue;
 
-      // 🧮 Calculate distance
       const dist = haversineDistanceMi(
         u.lastLocation.lat,
         u.lastLocation.lng,
@@ -113,8 +97,7 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
         eventLng
       );
 
-      if (isNaN(dist)) continue;
-      if (dist <= u.radiusMi) {
+      if (!isNaN(dist) && dist <= u.radiusMi) {
         eligibleTokens.push(...u.fcm_tokens);
       }
     }
@@ -124,7 +107,6 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
       return;
     }
 
-    // 📨 Prepare and send
     const message = {
       notification: { title, body },
       data: {
@@ -142,28 +124,94 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
       `📤 Notification sent to ${eligibleTokens.length} devices (success: ${response.successCount}, failed: ${response.failureCount})`
     );
 
-    // 🧹 Clean up invalid tokens
-    const invalidTokens = [];
-    response.responses.forEach((r, i) => {
-      if (!r.success) {
-        const code = r.error?.code || "unknown";
-        if (
-          code === "messaging/invalid-registration-token" ||
-          code === "messaging/registration-token-not-registered"
-        ) {
-          invalidTokens.push(eligibleTokens[i]);
-        }
-      }
-    });
-
-    if (invalidTokens.length > 0) {
-      await users.updateMany(
-        { fcm_tokens: { $in: invalidTokens } },
-        { $pull: { fcm_tokens: { $in: invalidTokens } } }
-      );
-      console.log(`🧹 Removed ${invalidTokens.length} invalid tokens.`);
-    }
+    await _cleanInvalidTokens(users, eligibleTokens, response);
   } catch (err) {
     console.error("❌ Error sending FCM notifications:", err);
+  }
+}
+
+// =============================================================
+// 🔔 Notify followers of an update (comments, resolve, etc.)
+// =============================================================
+
+export async function notifyFollowersOfUpdate(
+  collection,
+  docId,
+  actorId,
+  eventType,
+  text = ""
+) {
+  try {
+    const db = getDB();
+    const coll = db.collection(collection);
+    const post = await coll.findOne({ _id: docId });
+    if (!post) return console.warn(`⚠️ notifyFollowersOfUpdate: post ${docId} not found`);
+
+    // Skip notifying the actor
+    const followerIds = (post.followers || []).filter((id) => id !== actorId);
+    if (followerIds.length === 0) return;
+
+    const users = db.collection("users");
+    const followerDocs = await users
+      .find({ user_id: { $in: followerIds } })
+      .project({ fcm_tokens: 1 })
+      .toArray();
+
+    const tokens = followerDocs
+      .flatMap((u) => u.fcm_tokens || [])
+      .filter((t) => typeof t === "string" && t.length > 10);
+
+    if (tokens.length === 0) {
+      console.log(`ℹ️ No active tokens for followers of ${collection}/${docId}`);
+      return;
+    }
+
+    const title = `New ${eventType} on ${collection}`;
+    const body = text || `${eventType} update on a post you follow`;
+
+    const message = {
+      notification: { title, body },
+      data: {
+        deeplink: `disasterhelp://detail?c=${collection}&id=${docId}`,
+        collection,
+        docId: docId.toString(),
+        type: eventType,
+      },
+      tokens,
+    };
+
+    const res = await admin.messaging().sendEachForMulticast(message);
+    console.log(`📢 Follower update notif: ${res.successCount}/${tokens.length} succeeded`);
+
+    await _cleanInvalidTokens(users, tokens, res);
+  } catch (err) {
+    console.error("❌ notifyFollowersOfUpdate failed:", err);
+  }
+}
+
+// =============================================================
+// 🧹 Helper: Clean invalid tokens
+// =============================================================
+
+async function _cleanInvalidTokens(users, tokens, response) {
+  const invalidTokens = [];
+  response.responses.forEach((r, i) => {
+    if (!r.success) {
+      const code = r.error?.code || "unknown";
+      if (
+        code === "messaging/invalid-registration-token" ||
+        code === "messaging/registration-token-not-registered"
+      ) {
+        invalidTokens.push(tokens[i]);
+      }
+    }
+  });
+
+  if (invalidTokens.length > 0) {
+    await users.updateMany(
+      { fcm_tokens: { $in: invalidTokens } },
+      { $pull: { fcm_tokens: { $in: invalidTokens } } }
+    );
+    console.log(`🧹 Removed ${invalidTokens.length} invalid tokens.`);
   }
 }

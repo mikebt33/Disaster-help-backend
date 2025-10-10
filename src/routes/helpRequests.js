@@ -1,8 +1,8 @@
 import express from "express";
 import { getDB } from "../db.js";
 import { ObjectId } from "mongodb";
-import { notifyFollowers } from "../services/notifications.js";
-import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js"; // ✅ new
+import { notifyFollowers, notifyFollowersOfUpdate } from "../services/notifications.js";
+import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js";
 
 const router = express.Router();
 
@@ -16,9 +16,7 @@ router.post("/", async (req, res) => {
     const { user_id, type, message, lat, lng } = req.body;
 
     if (!lat || !lng) {
-      return res.status(400).json({
-        error: "Latitude (lat) and longitude (lng) are required.",
-      });
+      return res.status(400).json({ error: "Latitude (lat) and longitude (lng) are required." });
     }
 
     const db = getDB();
@@ -36,7 +34,7 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
-      followers: user_id ? [user_id] : [], // auto-follow creator
+      followers: user_id ? [user_id] : [], // ✅ auto-follow creator
       votes: {},
       timestamp: new Date(),
     };
@@ -116,10 +114,9 @@ router.get("/:id", async (req, res) => {
     const db = getDB();
     const helpRequests = db.collection("help_requests");
     const { id } = req.params;
-    const query =
-      /^[0-9a-fA-F]{24}$/.test(id)
-        ? { _id: new ObjectId(id) }
-        : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
 
     const doc = await helpRequests.findOne(query);
     if (!doc) return res.status(404).json({ error: "Help request not found." });
@@ -132,7 +129,6 @@ router.get("/:id", async (req, res) => {
 
 /**
  * PATCH /api/help-requests/:id/confirm
- * ✅ Notifies followers (no geofence)
  */
 router.patch("/:id/confirm", async (req, res) => {
   try {
@@ -142,10 +138,9 @@ router.patch("/:id/confirm", async (req, res) => {
     const db = getDB();
     const helpRequests = db.collection("help_requests");
     const { id } = req.params;
-    const query =
-      /^[0-9a-fA-F]{24}$/.test(id)
-        ? { _id: new ObjectId(id) }
-        : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
 
     const doc = await helpRequests.findOne(query);
     if (!doc) return res.status(404).json({ error: "Help request not found." });
@@ -167,9 +162,9 @@ router.patch("/:id/confirm", async (req, res) => {
 
     await helpRequests.updateOne(query, update);
 
-    // ✅ Notify followers (no geofence)
+    // ✅ Notify followers of the update (no geofence)
     setImmediate(() =>
-      notifyFollowers("help_requests", id, "Help request confirmed", doc.message || "A help request was confirmed.")
+      notifyFollowersOfUpdate("help_requests", id, user_id, "confirm", "A help request was confirmed.")
     );
 
     res.json({ message: "Confirm recorded." });
@@ -190,10 +185,9 @@ router.patch("/:id/dispute", async (req, res) => {
     const db = getDB();
     const helpRequests = db.collection("help_requests");
     const { id } = req.params;
-    const query =
-      /^[0-9a-fA-F]{24}$/.test(id)
-        ? { _id: new ObjectId(id) }
-        : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
 
     const doc = await helpRequests.findOne(query);
     if (!doc) return res.status(404).json({ error: "Help request not found." });
@@ -215,9 +209,9 @@ router.patch("/:id/dispute", async (req, res) => {
 
     await helpRequests.updateOne(query, update);
 
-    // ✅ Notify followers
+    // ✅ Notify followers of the update
     setImmediate(() =>
-      notifyFollowers("help_requests", id, "Help request disputed", doc.message || "A help request was disputed.")
+      notifyFollowersOfUpdate("help_requests", id, user_id, "dispute", "A help request was disputed.")
     );
 
     res.json({ message: "Dispute recorded." });
@@ -235,10 +229,9 @@ router.patch("/:id/resolve", async (req, res) => {
     const db = getDB();
     const helpRequests = db.collection("help_requests");
     const { id } = req.params;
-    const query =
-      /^[0-9a-fA-F]{24}$/.test(id)
-        ? { _id: new ObjectId(id) }
-        : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
 
     const result = await helpRequests.updateOne(query, {
       $set: { resolved: true, resolvedAt: new Date() },
@@ -246,9 +239,9 @@ router.patch("/:id/resolve", async (req, res) => {
     if (result.matchedCount === 0)
       return res.status(404).json({ error: "Help request not found." });
 
-    // ✅ Notify followers
+    // ✅ Notify followers of resolve event
     setImmediate(() =>
-      notifyFollowers("help_requests", id, "Help request resolved", "A followed help request has been marked as resolved.")
+      notifyFollowersOfUpdate("help_requests", id, null, "resolve", "A followed help request has been marked as resolved.")
     );
 
     res.json({ message: "Help request resolved." });
@@ -269,10 +262,9 @@ router.patch("/:id/follow", async (req, res) => {
     const db = getDB();
     const helpRequests = db.collection("help_requests");
     const { id } = req.params;
-    const query =
-      /^[0-9a-fA-F]{24}$/.test(id)
-        ? { _id: new ObjectId(id) }
-        : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
 
     const doc = await helpRequests.findOne(query);
     if (!doc) return res.status(404).json({ error: "Help request not found." });
@@ -298,7 +290,6 @@ router.patch("/:id/follow", async (req, res) => {
 
 /**
  * POST /api/help-requests/:id/comments
- * ✅ Notifies followers of updates
  */
 router.post("/:id/comments", async (req, res) => {
   try {
@@ -309,10 +300,9 @@ router.post("/:id/comments", async (req, res) => {
     const comments = db.collection("help_comments");
     const helpRequests = db.collection("help_requests");
     const { id } = req.params;
-    const query =
-      /^[0-9a-fA-F]{24}$/.test(id)
-        ? { _id: new ObjectId(id) }
-        : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
 
     const helpDoc = await helpRequests.findOne(query);
     if (!helpDoc) return res.status(404).json({ error: "Help request not found." });
@@ -326,14 +316,9 @@ router.post("/:id/comments", async (req, res) => {
 
     const result = await comments.insertOne(comment);
 
-    // ✅ Notify followers
+    // ✅ Notify followers of new comment/update
     setImmediate(() =>
-      notifyFollowers(
-        "help_requests",
-        id,
-        "New update on a help request you follow",
-        text || "A new comment was posted."
-      )
+      notifyFollowersOfUpdate("help_requests", id, user_id, "comment", text)
     );
 
     res.status(201).json({ id: result.insertedId.toString(), ...comment });
@@ -351,10 +336,9 @@ router.get("/:id/comments", async (req, res) => {
     const db = getDB();
     const comments = db.collection("help_comments");
     const { id } = req.params;
-    const filter =
-      /^[0-9a-fA-F]{24}$/.test(id)
-        ? { help_request_id: new ObjectId(id) }
-        : { help_request_id: id };
+    const filter = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { help_request_id: new ObjectId(id) }
+      : { help_request_id: id };
 
     const docs = await comments.find(filter).sort({ createdAt: 1 }).toArray();
     res.json(docs.map((c) => ({ ...c, _id: c._id.toString() })));
@@ -372,14 +356,14 @@ router.delete("/:id", async (req, res) => {
     const db = getDB();
     const helpRequests = db.collection("help_requests");
     const { id } = req.params;
-    const query =
-      /^[0-9a-fA-F]{24}$/.test(id)
-        ? { _id: new ObjectId(id) }
-        : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
 
     const result = await helpRequests.deleteOne(query);
     if (result.deletedCount === 0)
       return res.status(404).json({ error: "Help request not found or already deleted." });
+
     res.json({ message: "Help request deleted successfully." });
   } catch (error) {
     console.error("❌ Error deleting help request:", error);

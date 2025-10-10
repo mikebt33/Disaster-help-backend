@@ -1,8 +1,8 @@
 import express from "express";
 import { getDB } from "../db.js";
 import { ObjectId } from "mongodb";
-import { notifyFollowers } from "../services/notifications.js";
-import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js"; // ✅ new helper
+import { notifyFollowers, notifyFollowersOfUpdate } from "../services/notifications.js";
+import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js";
 
 const router = express.Router();
 
@@ -30,13 +30,13 @@ router.post("/", async (req, res) => {
       disputeCount: 0,
       resolved: false,
       followers: user_id ? [user_id] : [], // ✅ auto-follow creator
-      votes: {}, // ✅ track per-user votes
+      votes: {},
       timestamp: new Date(),
     };
 
     const result = await offers.insertOne(doc);
 
-    // ✅ Send geo-based notifications asynchronously
+    // ✅ Geo-based notifications
     setImmediate(async () => {
       try {
         await notifyNearbyUsers("offer_help", { ...doc, _id: result.insertedId });
@@ -123,7 +123,6 @@ router.get("/:id", async (req, res) => {
 
 /**
  * PATCH /api/offers/:id/confirm
- * ✅ Notify followers (no geofence)
  */
 router.patch("/:id/confirm", async (req, res) => {
   try {
@@ -157,9 +156,9 @@ router.patch("/:id/confirm", async (req, res) => {
 
     await offers.updateOne(query, update);
 
-    // ✅ Notify followers
+    // ✅ Notify followers of update (no geofence)
     setImmediate(() =>
-      notifyFollowers("offer_help", id, "Offer confirmed", doc.message || "An offer was confirmed.")
+      notifyFollowersOfUpdate("offer_help", id, user_id, "confirm", "An offer was confirmed.")
     );
 
     res.json({ message: "Confirm recorded." });
@@ -204,9 +203,9 @@ router.patch("/:id/dispute", async (req, res) => {
 
     await offers.updateOne(query, update);
 
-    // ✅ Notify followers
+    // ✅ Notify followers of update
     setImmediate(() =>
-      notifyFollowers("offer_help", id, "Offer disputed", doc.message || "An offer was disputed.")
+      notifyFollowersOfUpdate("offer_help", id, user_id, "dispute", "An offer was disputed.")
     );
 
     res.json({ message: "Dispute recorded." });
@@ -234,9 +233,9 @@ router.patch("/:id/resolve", async (req, res) => {
     if (result.matchedCount === 0)
       return res.status(404).json({ error: "Offer not found." });
 
-    // ✅ Notify followers
+    // ✅ Notify followers of resolve event
     setImmediate(() =>
-      notifyFollowers("offer_help", id, "Offer resolved", "A followed offer has been marked as resolved.")
+      notifyFollowersOfUpdate("offer_help", id, null, "resolve", "A followed offer has been marked as resolved.")
     );
 
     res.json({ message: "Offer resolved." });
@@ -285,7 +284,6 @@ router.patch("/:id/follow", async (req, res) => {
 
 /**
  * POST /api/offers/:id/comments
- * ✅ Notifies followers of updates
  */
 router.post("/:id/comments", async (req, res) => {
   try {
@@ -312,14 +310,9 @@ router.post("/:id/comments", async (req, res) => {
 
     const result = await comments.insertOne(comment);
 
-    // ✅ Notify followers
+    // ✅ Notify followers of new comment/update
     setImmediate(() =>
-      notifyFollowers(
-        "offer_help",
-        id,
-        "New update on an offer you follow",
-        text || "A new comment was posted."
-      )
+      notifyFollowersOfUpdate("offer_help", id, user_id, "comment", text)
     );
 
     res.status(201).json({ id: result.insertedId.toString(), ...comment });
