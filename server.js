@@ -9,6 +9,8 @@ import helpRoutes from "./src/routes/helpRequests.js";
 import offerRoutes from "./src/routes/offers.js";
 import hazardRoutes from "./src/routes/hazards.js";
 import alertRoutes from "./src/routes/alertsCap.js";
+import './src/services/notifications.js';
+import userRoutes from "./src/routes/user.js";
 
 dotenv.config();
 const app = express();
@@ -40,6 +42,7 @@ app.use("/api/help-requests", helpRoutes);
 app.use("/api/offers", offerRoutes);
 app.use("/api/hazards", hazardRoutes);
 app.use("/api/alerts-cap", alertRoutes);
+app.use("/api/user", userRoutes);
 
 // 🩺 Health check
 app.get("/healthz", async (_req, res) => {
