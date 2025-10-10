@@ -162,7 +162,7 @@ router.patch("/:id/follow", async (req, res) => {
     const doc = await hazards.findOne(query);
     if (!doc) return res.status(404).json({ error: "Hazard not found." });
 
-    const alreadyFollowing = doc.followers?.includes(user_id);
+    const alreadyFollowing = (doc.followers || []).includes(user_id);
     const update = alreadyFollowing
       ? { $pull: { followers: user_id } }
       : { $addToSet: { followers: user_id } };
