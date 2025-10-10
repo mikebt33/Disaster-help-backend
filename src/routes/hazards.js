@@ -11,9 +11,14 @@ router.post("/", async (req, res) => {
   try {
     const { type, description, geometry, severity, source } = req.body;
 
+    // 🚫 Prevent spoofing official CAP sources
+    if (["NWS", "FEMA", "USGS"].includes(source)) {
+      return res.status(400).json({ error: "Reserved source identifier." });
+    }
+
     if (!geometry || !geometry.type || !geometry.coordinates) {
       return res.status(400).json({
-        error: "geometry (GeoJSON object with type and coordinates) is required."
+        error: "geometry (GeoJSON object with type and coordinates) is required.",
       });
     }
 
@@ -26,7 +31,7 @@ router.post("/", async (req, res) => {
       severity: severity || "Unknown",
       source: source || "user",
       geometry, // must be valid GeoJSON (Point or Polygon)
-      timestamp: new Date()
+      timestamp: new Date(),
     };
 
     const result = await hazards.insertOne(doc);
@@ -40,7 +45,6 @@ router.post("/", async (req, res) => {
 /**
  * GET /api/hazards/near?lat=27.77&lng=-82.64&radius_km=5
  * Finds hazards near a coordinate or containing that coordinate.
- * Supports both Point and Polygon hazards.
  */
 router.get("/near", async (req, res) => {
   try {
@@ -49,45 +53,40 @@ router.get("/near", async (req, res) => {
     const radiusKm = parseFloat(req.query.radius_km || 5);
 
     if (isNaN(lat) || isNaN(lng)) {
-      return res
-        .status(400)
-        .json({ error: "Valid lat and lng query parameters are required." });
+      return res.status(400).json({ error: "Valid lat and lng are required." });
     }
 
     const db = getDB();
     const hazards = db.collection("hazards");
 
-    // 1️⃣ Find nearby point hazards within a radius
+    // 1️⃣ Nearby point hazards
     const pointHazards = await hazards
       .find({
         "geometry.type": "Point",
         geometry: {
           $geoWithin: {
-            $centerSphere: [[lng, lat], radiusKm / 6378.1] // Earth's radius in km
-          }
-        }
+            $centerSphere: [[lng, lat], radiusKm / 6378.1],
+          },
+        },
       })
       .toArray();
 
-    // 2️⃣ Find polygon hazards that contain the coordinate
+    // 2️⃣ Polygon hazards containing the coordinate
     const polygonHazards = await hazards
       .find({
         "geometry.type": "Polygon",
         geometry: {
           $geoIntersects: {
-            $geometry: { type: "Point", coordinates: [lng, lat] }
-          }
-        }
+            $geometry: { type: "Point", coordinates: [lng, lat] },
+          },
+        },
       })
       .toArray();
 
-    // Combine both sets
-    const results = [...pointHazards, ...polygonHazards];
-
     res.json({
-      count: results.length,
+      count: pointHazards.length + polygonHazards.length,
       location: { lat, lng, radius_km: radiusKm },
-      hazards: results
+      hazards: [...pointHazards, ...polygonHazards],
     });
   } catch (error) {
     console.error("❌ Error fetching nearby hazards:", error);
@@ -99,7 +98,7 @@ router.get("/near", async (req, res) => {
  * GET /api/hazards
  * Optional: List all hazards (for admin/debugging)
  */
-router.get("/", async (req, res) => {
+router.get("/", async (_req, res) => {
   try {
     const db = getDB();
     const hazards = db.collection("hazards");
