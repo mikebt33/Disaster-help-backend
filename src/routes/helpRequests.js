@@ -33,7 +33,8 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
-      followers: [], // array of user_ids
+      followers: [],
+      votes: {}, // ✅ store user votes here
       timestamp: new Date(),
     };
 
@@ -47,19 +48,12 @@ router.post("/", async (req, res) => {
 
 /**
  * GET /api/help-requests
- * Returns all help requests (most recent first)
  */
-router.get("/", async (req, res) => {
+router.get("/", async (_req, res) => {
   try {
     const db = getDB();
     const helpRequests = db.collection("help_requests");
-
-    const results = await helpRequests
-      .find({})
-      .sort({ timestamp: -1 })
-      .limit(100)
-      .toArray();
-
+    const results = await helpRequests.find({}).sort({ timestamp: -1 }).limit(100).toArray();
     res.json(results.map((r) => ({ ...r, _id: r._id.toString() })));
   } catch (error) {
     console.error("❌ Error fetching help requests:", error);
@@ -69,7 +63,6 @@ router.get("/", async (req, res) => {
 
 /**
  * GET /api/help-requests/near
- * Returns all help requests within a radius
  */
 router.get("/near", async (req, res) => {
   try {
@@ -78,14 +71,11 @@ router.get("/near", async (req, res) => {
     const radiusKm = parseFloat(req.query.radius_km || 5);
 
     if (isNaN(lat) || isNaN(lng)) {
-      return res.status(400).json({
-        error: "Valid lat and lng query parameters are required.",
-      });
+      return res.status(400).json({ error: "Valid lat and lng query parameters are required." });
     }
 
     const db = getDB();
     const helpRequests = db.collection("help_requests");
-
     const results = await helpRequests
       .find({
         location: {
@@ -131,6 +121,9 @@ router.get("/:id", async (req, res) => {
  */
 router.patch("/:id/confirm", async (req, res) => {
   try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: "user_id is required." });
+
     const db = getDB();
     const helpRequests = db.collection("help_requests");
     const { id } = req.params;
@@ -138,9 +131,25 @@ router.patch("/:id/confirm", async (req, res) => {
       ? { _id: new ObjectId(id) }
       : { _id: id };
 
-    const result = await helpRequests.updateOne(query, { $inc: { confirmCount: 1 } });
-    if (result.matchedCount === 0)
-      return res.status(404).json({ error: "Help request not found." });
+    const doc = await helpRequests.findOne(query);
+    if (!doc) return res.status(404).json({ error: "Help request not found." });
+
+    const votes = doc.votes || {};
+    const currentVote = votes[user_id];
+
+    if (currentVote === "confirm") {
+      return res.status(200).json({ message: "User already confirmed." });
+    }
+
+    const update = {};
+    if (currentVote === "dispute") {
+      update.$inc = { confirmCount: 1, disputeCount: -1 };
+    } else {
+      update.$inc = { confirmCount: 1 };
+    }
+    update.$set = { [`votes.${user_id}`]: "confirm" };
+
+    await helpRequests.updateOne(query, update);
     res.json({ message: "Confirm recorded." });
   } catch (error) {
     console.error("❌ Error confirming help request:", error);
@@ -153,6 +162,9 @@ router.patch("/:id/confirm", async (req, res) => {
  */
 router.patch("/:id/dispute", async (req, res) => {
   try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: "user_id is required." });
+
     const db = getDB();
     const helpRequests = db.collection("help_requests");
     const { id } = req.params;
@@ -160,9 +172,25 @@ router.patch("/:id/dispute", async (req, res) => {
       ? { _id: new ObjectId(id) }
       : { _id: id };
 
-    const result = await helpRequests.updateOne(query, { $inc: { disputeCount: 1 } });
-    if (result.matchedCount === 0)
-      return res.status(404).json({ error: "Help request not found." });
+    const doc = await helpRequests.findOne(query);
+    if (!doc) return res.status(404).json({ error: "Help request not found." });
+
+    const votes = doc.votes || {};
+    const currentVote = votes[user_id];
+
+    if (currentVote === "dispute") {
+      return res.status(200).json({ message: "User already disputed." });
+    }
+
+    const update = {};
+    if (currentVote === "confirm") {
+      update.$inc = { confirmCount: -1, disputeCount: 1 };
+    } else {
+      update.$inc = { disputeCount: 1 };
+    }
+    update.$set = { [`votes.${user_id}`]: "dispute" };
+
+    await helpRequests.updateOne(query, update);
     res.json({ message: "Dispute recorded." });
   } catch (error) {
     console.error("❌ Error disputing help request:", error);
@@ -196,7 +224,6 @@ router.patch("/:id/resolve", async (req, res) => {
 
 /**
  * PATCH /api/help-requests/:id/follow
- * Toggle following/unfollowing for a user
  */
 router.patch("/:id/follow", async (req, res) => {
   try {
@@ -232,7 +259,6 @@ router.patch("/:id/follow", async (req, res) => {
 
 /**
  * POST /api/help-requests/:id/comments
- * Add a comment/update to a help request
  */
 router.post("/:id/comments", async (req, res) => {
   try {
@@ -267,7 +293,6 @@ router.post("/:id/comments", async (req, res) => {
 
 /**
  * GET /api/help-requests/:id/comments
- * Fetch all comments for a help request
  */
 router.get("/:id/comments", async (req, res) => {
   try {

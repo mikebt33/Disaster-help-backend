@@ -27,6 +27,7 @@ router.post("/", async (req, res) => {
       disputeCount: 0,
       resolved: false,
       followers: [],
+      votes: {}, // ✅ track per-user votes
       timestamp: new Date(),
     };
 
@@ -40,19 +41,12 @@ router.post("/", async (req, res) => {
 
 /**
  * GET /api/offers
- * Returns all offers (most recent first)
  */
-router.get("/", async (req, res) => {
+router.get("/", async (_req, res) => {
   try {
     const db = getDB();
     const offers = db.collection("offer_help");
-
-    const results = await offers
-      .find({})
-      .sort({ timestamp: -1 })
-      .limit(100)
-      .toArray();
-
+    const results = await offers.find({}).sort({ timestamp: -1 }).limit(100).toArray();
     res.json(results.map((r) => ({ ...r, _id: r._id.toString() })));
   } catch (error) {
     console.error("❌ Error fetching offers:", error);
@@ -62,7 +56,6 @@ router.get("/", async (req, res) => {
 
 /**
  * GET /api/offers/near
- * Returns offers within radius (km)
  */
 router.get("/near", async (req, res) => {
   try {
@@ -70,13 +63,11 @@ router.get("/near", async (req, res) => {
     const lng = parseFloat(req.query.lng);
     const radiusKm = parseFloat(req.query.radius_km || 5);
 
-    if (isNaN(lat) || isNaN(lng)) {
+    if (isNaN(lat) || isNaN(lng))
       return res.status(400).json({ error: "Valid lat and lng required." });
-    }
 
     const db = getDB();
     const offers = db.collection("offer_help");
-
     const results = await offers
       .find({
         location: {
@@ -118,38 +109,109 @@ router.get("/:id", async (req, res) => {
 });
 
 /**
- * PATCH confirm/dispute/resolve
+ * PATCH /api/offers/:id/confirm
  */
-["confirm", "dispute", "resolve"].forEach((path) => {
-  const updates = {
-    confirm: { $inc: { confirmCount: 1 } },
-    dispute: { $inc: { disputeCount: 1 } },
-    resolve: { $set: { resolved: true, resolvedAt: new Date() } },
-  };
-  const messages = {
-    confirm: "Confirm recorded.",
-    dispute: "Dispute recorded.",
-    resolve: "Offer resolved.",
-  };
+router.patch("/:id/confirm", async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: "user_id is required." });
 
-  router.patch(`/:id/${path}`, async (req, res) => {
-    try {
-      const db = getDB();
-      const offers = db.collection("offer_help");
-      const { id } = req.params;
-      const query = /^[0-9a-fA-F]{24}$/.test(id)
-        ? { _id: new ObjectId(id) }
-        : { _id: id };
+    const db = getDB();
+    const offers = db.collection("offer_help");
+    const { id } = req.params;
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
 
-      const result = await offers.updateOne(query, updates[path]);
-      if (result.matchedCount === 0)
-        return res.status(404).json({ error: "Offer not found." });
-      res.json({ message: messages[path] });
-    } catch (error) {
-      console.error(`❌ Error updating offer (${path}):`, error);
-      res.status(500).json({ error: "Internal server error." });
+    const doc = await offers.findOne(query);
+    if (!doc) return res.status(404).json({ error: "Offer not found." });
+
+    const votes = doc.votes || {};
+    const currentVote = votes[user_id];
+
+    if (currentVote === "confirm") {
+      return res.status(200).json({ message: "User already confirmed." });
     }
-  });
+
+    const update = {};
+    if (currentVote === "dispute") {
+      update.$inc = { confirmCount: 1, disputeCount: -1 };
+    } else {
+      update.$inc = { confirmCount: 1 };
+    }
+    update.$set = { [`votes.${user_id}`]: "confirm" };
+
+    await offers.updateOne(query, update);
+    res.json({ message: "Confirm recorded." });
+  } catch (error) {
+    console.error("❌ Error confirming offer:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/**
+ * PATCH /api/offers/:id/dispute
+ */
+router.patch("/:id/dispute", async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: "user_id is required." });
+
+    const db = getDB();
+    const offers = db.collection("offer_help");
+    const { id } = req.params;
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
+
+    const doc = await offers.findOne(query);
+    if (!doc) return res.status(404).json({ error: "Offer not found." });
+
+    const votes = doc.votes || {};
+    const currentVote = votes[user_id];
+
+    if (currentVote === "dispute") {
+      return res.status(200).json({ message: "User already disputed." });
+    }
+
+    const update = {};
+    if (currentVote === "confirm") {
+      update.$inc = { confirmCount: -1, disputeCount: 1 };
+    } else {
+      update.$inc = { disputeCount: 1 };
+    }
+    update.$set = { [`votes.${user_id}`]: "dispute" };
+
+    await offers.updateOne(query, update);
+    res.json({ message: "Dispute recorded." });
+  } catch (error) {
+    console.error("❌ Error disputing offer:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/**
+ * PATCH /api/offers/:id/resolve
+ */
+router.patch("/:id/resolve", async (req, res) => {
+  try {
+    const db = getDB();
+    const offers = db.collection("offer_help");
+    const { id } = req.params;
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
+
+    const result = await offers.updateOne(query, {
+      $set: { resolved: true, resolvedAt: new Date() },
+    });
+    if (result.matchedCount === 0)
+      return res.status(404).json({ error: "Offer not found." });
+    res.json({ message: "Offer resolved." });
+  } catch (error) {
+    console.error("❌ Error resolving offer:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
 });
 
 /**
@@ -176,7 +238,6 @@ router.patch("/:id/follow", async (req, res) => {
       : { $addToSet: { followers: user_id } };
 
     await offers.updateOne(query, update);
-
     res.json({
       message: alreadyFollowing ? "Unfollowed" : "Followed",
       following: !alreadyFollowing,
