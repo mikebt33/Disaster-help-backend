@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import cron from "node-cron";
 import { connectDB } from "./src/db.js";
 import { runCleanup } from "./src/services/cleanupService.js";
-import { pollCapFeeds } from "./src/services/capPoller.js";
+import { pollCapFeeds } from "./src/services/capPoller.mjs";
 import helpRoutes from "./src/routes/helpRequests.js";
 import offerRoutes from "./src/routes/offers.js";
 import hazardRoutes from "./src/routes/hazards.js";
