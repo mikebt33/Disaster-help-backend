@@ -7,13 +7,14 @@
  * Responsibilities:
  *   ✅ Use shared Firebase Admin instance (via firebaseAdmin.js)
  *   ✅ Register user FCM tokens
- *   ✅ Send notifications to all followers of a post
+ *   ✅ Send notifications to followers of a post WITH geofence filtering
  *   ✅ Clean up invalid tokens automatically
  * -------------------------------------------------------------
  */
 
 import admin from "./firebaseAdmin.js";
 import { getDB } from "../db.js";
+import { haversineDistanceMi } from "../utils/geoUtils.js"; // ✅ distance helper
 
 // =============================================================
 // 🔖 Register a user’s FCM token
@@ -51,17 +52,20 @@ export async function registerFcmToken(userId, token) {
 }
 
 // =============================================================
-// 📣 Send notifications to followers of a post
+// 📣 Send notifications to followers (geo-filtered)
 // =============================================================
 
 /**
- * Notify all followers of a post (help, offer, or hazard).
+ * Notify all followers of a post (help, offer, or hazard),
+ * but only if the event is within their configured radiusMi.
  *
- * @param {string} collection - "help_requests" | "offer_help" | "hazards"
- * @param {string|ObjectId} docId - Post/document ID
- * @param {string} title - Notification title
- * @param {string} body - Notification body text
- * @param {object} data - Extra payload (optional)
+ * Each follower document must contain:
+ *   {
+ *     user_id,
+ *     fcm_tokens: [ ... ],
+ *     lastLocation: { lat, lng },
+ *     radiusMi: number
+ *   }
  */
 export async function notifyFollowers(collection, docId, title, body, data = {}) {
   try {
@@ -80,21 +84,47 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
       return;
     }
 
+    // 🔍 Determine event location (hazards.geometry / help_requests.location)
+    let eventLat = 0, eventLng = 0;
+    if (post.geometry?.coordinates?.length >= 2) {
+      [eventLng, eventLat] = post.geometry.coordinates;
+    } else if (post.location?.coordinates?.length >= 2) {
+      [eventLng, eventLat] = post.location.coordinates;
+    } else {
+      console.warn("⚠️ Event has no valid location geometry, skipping geo filter.");
+    }
+
+    // 🔎 Get all follower user profiles
     const users = db.collection("users");
     const followerDocs = await users
       .find({ user_id: { $in: followerIds } })
-      .project({ fcm_tokens: 1 })
+      .project({ fcm_tokens: 1, lastLocation: 1, radiusMi: 1 })
       .toArray();
 
-    const tokens = followerDocs
-      .flatMap((u) => u.fcm_tokens || [])
-      .filter((t) => typeof t === "string" && t.length > 10);
+    const eligibleTokens = [];
+    for (const u of followerDocs) {
+      if (!u.fcm_tokens?.length || !u.lastLocation || !u.radiusMi) continue;
 
-    if (tokens.length === 0) {
-      console.log(`ℹ️ No active FCM tokens for followers of ${docId}`);
+      // 🧮 Calculate distance
+      const dist = haversineDistanceMi(
+        u.lastLocation.lat,
+        u.lastLocation.lng,
+        eventLat,
+        eventLng
+      );
+
+      if (isNaN(dist)) continue;
+      if (dist <= u.radiusMi) {
+        eligibleTokens.push(...u.fcm_tokens);
+      }
+    }
+
+    if (eligibleTokens.length === 0) {
+      console.log(`ℹ️ No followers within geofence for ${collection}/${docId}`);
       return;
     }
 
+    // 📨 Prepare and send
     const message = {
       notification: { title, body },
       data: {
@@ -103,16 +133,16 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
         docId: docId.toString(),
         ...data,
       },
-      tokens,
+      tokens: eligibleTokens,
     };
 
     const response = await admin.messaging().sendEachForMulticast(message);
 
     console.log(
-      `📤 Notification sent to ${tokens.length} devices (success: ${response.successCount}, failed: ${response.failureCount})`
+      `📤 Notification sent to ${eligibleTokens.length} devices (success: ${response.successCount}, failed: ${response.failureCount})`
     );
 
-    // Clean up invalid tokens
+    // 🧹 Clean up invalid tokens
     const invalidTokens = [];
     response.responses.forEach((r, i) => {
       if (!r.success) {
@@ -121,7 +151,7 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
           code === "messaging/invalid-registration-token" ||
           code === "messaging/registration-token-not-registered"
         ) {
-          invalidTokens.push(tokens[i]);
+          invalidTokens.push(eligibleTokens[i]);
         }
       }
     });

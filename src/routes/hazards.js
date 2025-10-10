@@ -1,12 +1,15 @@
 import express from "express";
 import { getDB } from "../db.js";
 import { ObjectId } from "mongodb";
+import { notifyFollowers } from "../services/notifications.js";
+import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js"; // ✅ new helper for geofence alerts
 
 const router = express.Router();
 
 /**
  * POST /api/hazards
  * Create a new hazard
+ * ✅ Triggers geo-based notifications for users near the hazard
  */
 router.post("/", async (req, res) => {
   try {
@@ -31,12 +34,22 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
-      followers: user_id ? [user_id] : [], // ✅ auto-follow creator
-      votes: {}, // ✅ per-user voting map
+      followers: user_id ? [user_id] : [], // auto-follow creator
+      votes: {},
       timestamp: new Date(),
     };
 
     const result = await hazards.insertOne(doc);
+
+    // ✅ Fire geo-notifications asynchronously
+    setImmediate(async () => {
+      try {
+        await notifyNearbyUsers("hazards", { ...doc, _id: result.insertedId });
+      } catch (e) {
+        console.error("❌ notifyNearbyUsers failed:", e);
+      }
+    });
+
     res.status(201).json({ id: result.insertedId.toString(), ...doc });
   } catch (error) {
     console.error("❌ Error creating hazard:", error);
@@ -115,6 +128,7 @@ router.get("/:id", async (req, res) => {
 
 /**
  * PATCH /api/hazards/:id/confirm
+ * ✅ Triggers notifications to followers (no geo filter)
  */
 router.patch("/:id/confirm", async (req, res) => {
   try {
@@ -137,9 +151,7 @@ router.patch("/:id/confirm", async (req, res) => {
       return res.status(200).json({ message: "User already confirmed." });
     }
 
-    const update = { $set: { [`votes.${user_id}`]: "confirm" } };
-    update.$inc = {};
-
+    const update = { $set: { [`votes.${user_id}`]: "confirm" }, $inc: {} };
     if (currentVote === "dispute") {
       update.$inc.confirmCount = 1;
       update.$inc.disputeCount = -1;
@@ -147,9 +159,12 @@ router.patch("/:id/confirm", async (req, res) => {
       update.$inc.confirmCount = 1;
     }
 
-    const result = await hazards.updateOne(query, update);
-    if (result.matchedCount === 0)
-      return res.status(404).json({ error: "Hazard not found." });
+    await hazards.updateOne(query, update);
+
+    // ✅ Notify followers (no geofence)
+    setImmediate(() =>
+      notifyFollowers("hazards", id, "Hazard confirmed", doc.description || "A hazard was confirmed.")
+    );
 
     res.json({ message: "Confirm recorded." });
   } catch (error) {
@@ -182,9 +197,7 @@ router.patch("/:id/dispute", async (req, res) => {
       return res.status(200).json({ message: "User already disputed." });
     }
 
-    const update = { $set: { [`votes.${user_id}`]: "dispute" } };
-    update.$inc = {};
-
+    const update = { $set: { [`votes.${user_id}`]: "dispute" }, $inc: {} };
     if (currentVote === "confirm") {
       update.$inc.confirmCount = -1;
       update.$inc.disputeCount = 1;
@@ -192,9 +205,12 @@ router.patch("/:id/dispute", async (req, res) => {
       update.$inc.disputeCount = 1;
     }
 
-    const result = await hazards.updateOne(query, update);
-    if (result.matchedCount === 0)
-      return res.status(404).json({ error: "Hazard not found." });
+    await hazards.updateOne(query, update);
+
+    // ✅ Notify followers (no geofence)
+    setImmediate(() =>
+      notifyFollowers("hazards", id, "Hazard disputed", doc.description || "A hazard was disputed.")
+    );
 
     res.json({ message: "Dispute recorded." });
   } catch (error) {
@@ -219,6 +235,12 @@ router.patch("/:id/resolve", async (req, res) => {
     });
     if (result.matchedCount === 0)
       return res.status(404).json({ error: "Hazard not found." });
+
+    // ✅ Notify followers
+    setImmediate(() =>
+      notifyFollowers("hazards", id, "Hazard resolved", "A followed hazard has been marked as resolved.")
+    );
+
     res.json({ message: "Hazard resolved." });
   } catch (error) {
     console.error("❌ Error resolving hazard:", error);
@@ -264,6 +286,7 @@ router.patch("/:id/follow", async (req, res) => {
 
 /**
  * POST /api/hazards/:id/comments
+ * ✅ Notifies followers about new updates/comments
  */
 router.post("/:id/comments", async (req, res) => {
   try {
@@ -288,6 +311,17 @@ router.post("/:id/comments", async (req, res) => {
     };
 
     const result = await comments.insertOne(comment);
+
+    // ✅ Notify followers about update
+    setImmediate(() =>
+      notifyFollowers(
+        "hazards",
+        id,
+        "New update on a hazard you follow",
+        text || "A new comment was posted."
+      )
+    );
+
     res.status(201).json({ id: result.insertedId.toString(), ...comment });
   } catch (error) {
     console.error("❌ Error adding hazard comment:", error);

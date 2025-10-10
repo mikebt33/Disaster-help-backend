@@ -1,12 +1,15 @@
 import express from "express";
 import { getDB } from "../db.js";
 import { ObjectId } from "mongodb";
+import { notifyFollowers } from "../services/notifications.js";
+import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js"; // ✅ new helper
 
 const router = express.Router();
 
 /**
  * POST /api/offers
  * Create a new offer
+ * ✅ Triggers geo-based notifications for nearby users
  */
 router.post("/", async (req, res) => {
   try {
@@ -32,6 +35,16 @@ router.post("/", async (req, res) => {
     };
 
     const result = await offers.insertOne(doc);
+
+    // ✅ Send geo-based notifications asynchronously
+    setImmediate(async () => {
+      try {
+        await notifyNearbyUsers("offer_help", { ...doc, _id: result.insertedId });
+      } catch (err) {
+        console.error("❌ notifyNearbyUsers failed:", err);
+      }
+    });
+
     res.status(201).json({ id: result.insertedId.toString(), ...doc });
   } catch (error) {
     console.error("❌ Error creating offer:", error);
@@ -110,6 +123,7 @@ router.get("/:id", async (req, res) => {
 
 /**
  * PATCH /api/offers/:id/confirm
+ * ✅ Notify followers (no geofence)
  */
 router.patch("/:id/confirm", async (req, res) => {
   try {
@@ -133,15 +147,21 @@ router.patch("/:id/confirm", async (req, res) => {
       return res.status(200).json({ message: "User already confirmed." });
     }
 
-    const update = {};
+    const update = { $set: { [`votes.${user_id}`]: "confirm" }, $inc: {} };
     if (currentVote === "dispute") {
-      update.$inc = { confirmCount: 1, disputeCount: -1 };
+      update.$inc.confirmCount = 1;
+      update.$inc.disputeCount = -1;
     } else {
-      update.$inc = { confirmCount: 1 };
+      update.$inc.confirmCount = 1;
     }
-    update.$set = { [`votes.${user_id}`]: "confirm" };
 
     await offers.updateOne(query, update);
+
+    // ✅ Notify followers
+    setImmediate(() =>
+      notifyFollowers("offer_help", id, "Offer confirmed", doc.message || "An offer was confirmed.")
+    );
+
     res.json({ message: "Confirm recorded." });
   } catch (error) {
     console.error("❌ Error confirming offer:", error);
@@ -174,15 +194,21 @@ router.patch("/:id/dispute", async (req, res) => {
       return res.status(200).json({ message: "User already disputed." });
     }
 
-    const update = {};
+    const update = { $set: { [`votes.${user_id}`]: "dispute" }, $inc: {} };
     if (currentVote === "confirm") {
-      update.$inc = { confirmCount: -1, disputeCount: 1 };
+      update.$inc.confirmCount = -1;
+      update.$inc.disputeCount = 1;
     } else {
-      update.$inc = { disputeCount: 1 };
+      update.$inc.disputeCount = 1;
     }
-    update.$set = { [`votes.${user_id}`]: "dispute" };
 
     await offers.updateOne(query, update);
+
+    // ✅ Notify followers
+    setImmediate(() =>
+      notifyFollowers("offer_help", id, "Offer disputed", doc.message || "An offer was disputed.")
+    );
+
     res.json({ message: "Dispute recorded." });
   } catch (error) {
     console.error("❌ Error disputing offer:", error);
@@ -207,6 +233,12 @@ router.patch("/:id/resolve", async (req, res) => {
     });
     if (result.matchedCount === 0)
       return res.status(404).json({ error: "Offer not found." });
+
+    // ✅ Notify followers
+    setImmediate(() =>
+      notifyFollowers("offer_help", id, "Offer resolved", "A followed offer has been marked as resolved.")
+    );
+
     res.json({ message: "Offer resolved." });
   } catch (error) {
     console.error("❌ Error resolving offer:", error);
@@ -253,6 +285,7 @@ router.patch("/:id/follow", async (req, res) => {
 
 /**
  * POST /api/offers/:id/comments
+ * ✅ Notifies followers of updates
  */
 router.post("/:id/comments", async (req, res) => {
   try {
@@ -278,6 +311,17 @@ router.post("/:id/comments", async (req, res) => {
     };
 
     const result = await comments.insertOne(comment);
+
+    // ✅ Notify followers
+    setImmediate(() =>
+      notifyFollowers(
+        "offer_help",
+        id,
+        "New update on an offer you follow",
+        text || "A new comment was posted."
+      )
+    );
+
     res.status(201).json({ id: result.insertedId.toString(), ...comment });
   } catch (error) {
     console.error("❌ Error adding offer comment:", error);
