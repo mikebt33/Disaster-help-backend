@@ -103,4 +103,31 @@ router.get("/:id", async (req, res) => {
   }
 });
 
+/**
+ * DELETE /api/offers/:id
+ * Deletes an offer to help by its ID
+ */
+router.delete("/:id", async (req, res) => {
+  try {
+    const db = getDB();
+    const offers = db.collection("offer_help");
+    const { id } = req.params;
+
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
+
+    const result = await offers.deleteOne(query);
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: "Offer not found or already deleted." });
+    }
+
+    res.json({ message: "Offer deleted successfully." });
+  } catch (error) {
+    console.error("❌ Error deleting offer:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
 export default router;

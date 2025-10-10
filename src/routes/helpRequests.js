@@ -65,7 +65,7 @@ router.get("/near", async (req, res) => {
         location: {
           $nearSphere: {
             $geometry: { type: "Point", coordinates: [lng, lat] },
-            $maxDistance: radiusKm * 1000, // convert km → meters
+            $maxDistance: radiusKm * 1000, // km → meters
           },
         },
       })
@@ -100,6 +100,33 @@ router.get("/:id", async (req, res) => {
     res.json({ ...doc, _id: doc._id.toString() });
   } catch (error) {
     console.error("❌ Error fetching help request:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/**
+ * DELETE /api/help-requests/:id
+ * Deletes a help request by its ID
+ */
+router.delete("/:id", async (req, res) => {
+  try {
+    const db = getDB();
+    const helpRequests = db.collection("help_requests");
+    const { id } = req.params;
+
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
+
+    const result = await helpRequests.deleteOne(query);
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: "Help request not found or already deleted." });
+    }
+
+    res.json({ message: "Help request deleted successfully." });
+  } catch (error) {
+    console.error("❌ Error deleting help request:", error);
     res.status(500).json({ error: "Internal server error." });
   }
 });

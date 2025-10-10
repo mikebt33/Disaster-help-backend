@@ -106,7 +106,12 @@ router.get("/", async (_req, res) => {
   try {
     const db = getDB();
     const hazards = db.collection("hazards");
-    const all = await hazards.find({}).sort({ timestamp: -1 }).limit(100).toArray();
+    const all = await hazards
+      .find({})
+      .sort({ timestamp: -1 })
+      .limit(100)
+      .toArray();
+
     res.json(all.map((h) => ({ ...h, _id: h._id.toString() })));
   } catch (error) {
     console.error("❌ Error listing hazards:", error);
@@ -134,6 +139,35 @@ router.get("/:id", async (req, res) => {
     res.json({ ...doc, _id: doc._id.toString() });
   } catch (error) {
     console.error("❌ Error fetching hazard:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/**
+ * DELETE /api/hazards/:id
+ * Deletes a hazard report by its ID
+ */
+router.delete("/:id", async (req, res) => {
+  try {
+    const db = getDB();
+    const hazards = db.collection("hazards");
+    const { id } = req.params;
+
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
+
+    const result = await hazards.deleteOne(query);
+
+    if (result.deletedCount === 0) {
+      return res
+        .status(404)
+        .json({ error: "Hazard not found or already deleted." });
+    }
+
+    res.json({ message: "Hazard deleted successfully." });
+  } catch (error) {
+    console.error("❌ Error deleting hazard:", error);
     res.status(500).json({ error: "Internal server error." });
   }
 });
