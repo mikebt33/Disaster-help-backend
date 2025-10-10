@@ -131,19 +131,27 @@ router.patch("/:id/confirm", async (req, res) => {
     const votes = doc.votes || {};
     const currentVote = votes[user_id];
 
+    // Already confirmed
     if (currentVote === "confirm") {
       return res.status(200).json({ message: "User already confirmed." });
     }
 
-    const update = {};
-    if (currentVote === "dispute") {
-      update.$inc = { confirmCount: 1, disputeCount: -1 };
-    } else {
-      update.$inc = { confirmCount: 1 };
-    }
-    update.$set = { [`votes.${user_id}`]: "confirm" };
+    // Prepare atomic update
+    const update = { $set: { [`votes.${user_id}`]: "confirm" } };
+    update.$inc = {};
 
-    await hazards.updateOne(query, update);
+    // Switch from dispute → confirm
+    if (currentVote === "dispute") {
+      update.$inc.confirmCount = 1;
+      update.$inc.disputeCount = -1;
+    } else {
+      update.$inc.confirmCount = 1;
+    }
+
+    const result = await hazards.updateOne(query, update);
+    if (result.matchedCount === 0)
+      return res.status(404).json({ error: "Hazard not found." });
+
     res.json({ message: "Confirm recorded." });
   } catch (error) {
     console.error("❌ Error confirming hazard:", error);
@@ -175,21 +183,28 @@ router.patch("/:id/dispute", async (req, res) => {
       return res.status(200).json({ message: "User already disputed." });
     }
 
-    const update = {};
-    if (currentVote === "confirm") {
-      update.$inc = { confirmCount: -1, disputeCount: 1 };
-    } else {
-      update.$inc = { disputeCount: 1 };
-    }
-    update.$set = { [`votes.${user_id}`]: "dispute" };
+    const update = { $set: { [`votes.${user_id}`]: "dispute" } };
+    update.$inc = {};
 
-    await hazards.updateOne(query, update);
+    if (currentVote === "confirm") {
+      update.$inc.confirmCount = -1;
+      update.$inc.disputeCount = 1;
+    } else {
+      update.$inc.disputeCount = 1;
+    }
+
+    const result = await hazards.updateOne(query, update);
+    if (result.matchedCount === 0)
+      return res.status(404).json({ error: "Hazard not found." });
+
     res.json({ message: "Dispute recorded." });
   } catch (error) {
     console.error("❌ Error disputing hazard:", error);
     res.status(500).json({ error: "Internal server error." });
   }
 });
+
+
 
 /**
  * PATCH /api/hazards/:id/resolve
