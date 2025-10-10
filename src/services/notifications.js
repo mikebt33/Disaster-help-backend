@@ -5,9 +5,8 @@
  * for Disaster Help backend.
  *
  * Responsibilities:
- *   ✅ Use shared Firebase Admin instance (via firebaseAdmin.js)
- *   ✅ Register user FCM tokens
- *   ✅ Send notifications to followers of a post (geo-filtered)
+ *   ✅ Register FCM tokens
+ *   ✅ Send notifications to followers (geo-filtered)
  *   ✅ Notify followers of updates (comments, resolves, etc.)
  *   ✅ Clean up invalid tokens automatically
  * -------------------------------------------------------------
@@ -15,7 +14,8 @@
 
 import admin from "./firebaseAdmin.js";
 import { getDB } from "../db.js";
-import { haversineDistanceMi } from "../utils/geoUtils.js"; // ✅ distance helper
+import { ObjectId } from "mongodb";
+import { haversineDistanceMi } from "../utils/geoUtils.js";
 
 // =============================================================
 // 🔖 Register a user’s FCM token
@@ -56,8 +56,12 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
   try {
     const db = getDB();
     const coll = db.collection(collection);
-    const post = await coll.findOne({ _id: docId });
 
+    // ✅ Convert to ObjectId if valid
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(docId) ? { _id: new ObjectId(docId) } : { _id: docId };
+
+    const post = await coll.findOne(query);
     if (!post) {
       console.warn(`⚠️ notifyFollowers: document ${docId} not found in ${collection}`);
       return;
@@ -119,7 +123,6 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
     };
 
     const response = await admin.messaging().sendEachForMulticast(message);
-
     console.log(
       `📤 Notification sent to ${eligibleTokens.length} devices (success: ${response.successCount}, failed: ${response.failureCount})`
     );
@@ -144,7 +147,12 @@ export async function notifyFollowersOfUpdate(
   try {
     const db = getDB();
     const coll = db.collection(collection);
-    const post = await coll.findOne({ _id: docId });
+
+    // ✅ Convert string ID → ObjectId
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(docId) ? { _id: new ObjectId(docId) } : { _id: docId };
+
+    const post = await coll.findOne(query);
     if (!post) return console.warn(`⚠️ notifyFollowersOfUpdate: post ${docId} not found`);
 
     // Skip notifying the actor
