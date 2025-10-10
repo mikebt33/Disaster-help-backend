@@ -1,5 +1,6 @@
 import express from "express";
 import { getDB } from "../db.js";
+import { ObjectId } from "mongodb";
 
 const router = express.Router();
 
@@ -7,7 +8,7 @@ const router = express.Router();
  * GET /api/alerts-cap
  * Returns recent CAP alerts that have valid geometry
  */
-router.get("/", async (req, res) => {
+router.get("/", async (_req, res) => {
   try {
     const db = getDB();
     const alerts = db.collection("alerts_cap");
@@ -21,14 +22,13 @@ router.get("/", async (req, res) => {
 
     res.json({
       count: recent.length,
-      alerts: recent,
+      alerts: recent.map((a) => ({ ...a, _id: a._id.toString() })),
     });
   } catch (error) {
-    console.error("Error fetching CAP alerts:", error);
+    console.error("❌ Error fetching CAP alerts:", error);
     res.status(500).json({ error: "Failed to fetch CAP alerts." });
   }
 });
-
 
 /**
  * GET /api/alerts-cap/:id
@@ -41,7 +41,6 @@ router.get("/:id", async (req, res) => {
     const { id } = req.params;
 
     console.log(`[CAP] Lookup requested for ID: ${id}`);
-    const { ObjectId } = await import("mongodb");
 
     let alert = null;
 
@@ -75,9 +74,9 @@ router.get("/:id", async (req, res) => {
     }
 
     // ✅ Success
-    res.json(alert);
+    res.json({ ...alert, _id: alert._id.toString() });
   } catch (error) {
-    console.error("Error fetching CAP alert:", error);
+    console.error("❌ Error fetching CAP alert:", error);
     res.status(500).json({ error: "Failed to fetch CAP alert." });
   }
 });

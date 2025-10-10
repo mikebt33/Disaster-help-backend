@@ -1,5 +1,6 @@
 import express from "express";
 import { getDB } from "../db.js";
+import { ObjectId } from "mongodb";
 
 const router = express.Router();
 
@@ -35,7 +36,7 @@ router.post("/", async (req, res) => {
     };
 
     const result = await hazards.insertOne(doc);
-    res.status(201).json({ id: result.insertedId, ...doc });
+    res.status(201).json({ id: result.insertedId.toString(), ...doc });
   } catch (error) {
     console.error("❌ Error creating hazard:", error);
     res.status(500).json({ error: "Internal server error." });
@@ -86,7 +87,10 @@ router.get("/near", async (req, res) => {
     res.json({
       count: pointHazards.length + polygonHazards.length,
       location: { lat, lng, radius_km: radiusKm },
-      hazards: [...pointHazards, ...polygonHazards],
+      hazards: [...pointHazards, ...polygonHazards].map((h) => ({
+        ...h,
+        _id: h._id.toString(),
+      })),
     });
   } catch (error) {
     console.error("❌ Error fetching nearby hazards:", error);
@@ -103,9 +107,33 @@ router.get("/", async (_req, res) => {
     const db = getDB();
     const hazards = db.collection("hazards");
     const all = await hazards.find({}).sort({ timestamp: -1 }).limit(100).toArray();
-    res.json(all);
+    res.json(all.map((h) => ({ ...h, _id: h._id.toString() })));
   } catch (error) {
     console.error("❌ Error listing hazards:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/**
+ * GET /api/hazards/:id
+ * Fetch a single hazard by ObjectId or string ID
+ */
+router.get("/:id", async (req, res) => {
+  try {
+    const db = getDB();
+    const hazards = db.collection("hazards");
+    const { id } = req.params;
+
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
+
+    const doc = await hazards.findOne(query);
+    if (!doc) return res.status(404).json({ error: "Hazard not found" });
+
+    res.json({ ...doc, _id: doc._id.toString() });
+  } catch (error) {
+    console.error("❌ Error fetching hazard:", error);
     res.status(500).json({ error: "Internal server error." });
   }
 });
