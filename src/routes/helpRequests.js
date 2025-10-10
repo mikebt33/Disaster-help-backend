@@ -33,8 +33,8 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
-      followers: [],
-      votes: {}, // ✅ store user votes here
+      followers: user_id ? [user_id] : [], // ✅ auto-follow the creator
+      votes: {}, // ✅ per-user vote tracking
       timestamp: new Date(),
     };
 
@@ -240,7 +240,9 @@ router.patch("/:id/follow", async (req, res) => {
     const doc = await helpRequests.findOne(query);
     if (!doc) return res.status(404).json({ error: "Help request not found." });
 
-    const alreadyFollowing = doc.followers?.includes(user_id);
+    const followers = doc.followers || [];
+    const alreadyFollowing = followers.includes(user_id);
+
     const update = alreadyFollowing
       ? { $pull: { followers: user_id } }
       : { $addToSet: { followers: user_id } };

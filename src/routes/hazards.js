@@ -20,6 +20,7 @@ router.post("/", async (req, res) => {
 
     const db = getDB();
     const hazards = db.collection("hazards");
+
     const doc = {
       user_id: user_id || null,
       type: type || "hazard",
@@ -30,8 +31,8 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
-      followers: [],
-      votes: {}, // ✅ per-user vote tracking
+      followers: user_id ? [user_id] : [], // ✅ auto-follow creator
+      votes: {}, // ✅ per-user voting map
       timestamp: new Date(),
     };
 
@@ -66,11 +67,13 @@ router.get("/near", async (req, res) => {
     const lat = parseFloat(req.query.lat);
     const lng = parseFloat(req.query.lng);
     const radiusKm = parseFloat(req.query.radius_km || 5);
+
     if (isNaN(lat) || isNaN(lng))
       return res.status(400).json({ error: "Valid lat and lng required." });
 
     const db = getDB();
     const hazards = db.collection("hazards");
+
     const results = await hazards
       .find({
         geometry: {
@@ -98,9 +101,8 @@ router.get("/:id", async (req, res) => {
     const db = getDB();
     const hazards = db.collection("hazards");
     const { id } = req.params;
-    const query = /^[0-9a-fA-F]{24}$/.test(id)
-      ? { _id: new ObjectId(id) }
-      : { _id: id };
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(id) ? { _id: new ObjectId(id) } : { _id: id };
 
     const doc = await hazards.findOne(query);
     if (!doc) return res.status(404).json({ error: "Hazard not found." });
@@ -131,16 +133,13 @@ router.patch("/:id/confirm", async (req, res) => {
     const votes = doc.votes || {};
     const currentVote = votes[user_id];
 
-    // Already confirmed
     if (currentVote === "confirm") {
       return res.status(200).json({ message: "User already confirmed." });
     }
 
-    // Prepare atomic update
     const update = { $set: { [`votes.${user_id}`]: "confirm" } };
     update.$inc = {};
 
-    // Switch from dispute → confirm
     if (currentVote === "dispute") {
       update.$inc.confirmCount = 1;
       update.$inc.disputeCount = -1;
@@ -204,8 +203,6 @@ router.patch("/:id/dispute", async (req, res) => {
   }
 });
 
-
-
 /**
  * PATCH /api/hazards/:id/resolve
  */
@@ -246,12 +243,15 @@ router.patch("/:id/follow", async (req, res) => {
     const doc = await hazards.findOne(query);
     if (!doc) return res.status(404).json({ error: "Hazard not found." });
 
-    const alreadyFollowing = (doc.followers || []).includes(user_id);
+    const followers = doc.followers || [];
+    const alreadyFollowing = followers.includes(user_id);
+
     const update = alreadyFollowing
       ? { $pull: { followers: user_id } }
       : { $addToSet: { followers: user_id } };
 
     await hazards.updateOne(query, update);
+
     res.json({
       message: alreadyFollowing ? "Unfollowed" : "Followed",
       following: !alreadyFollowing,

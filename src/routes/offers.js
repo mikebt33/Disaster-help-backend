@@ -26,7 +26,7 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
-      followers: [],
+      followers: user_id ? [user_id] : [], // ✅ auto-follow creator
       votes: {}, // ✅ track per-user votes
       timestamp: new Date(),
     };
@@ -232,12 +232,15 @@ router.patch("/:id/follow", async (req, res) => {
     const doc = await offers.findOne(query);
     if (!doc) return res.status(404).json({ error: "Offer not found." });
 
-    const alreadyFollowing = doc.followers?.includes(user_id);
+    const followers = doc.followers || [];
+    const alreadyFollowing = followers.includes(user_id);
+
     const update = alreadyFollowing
       ? { $pull: { followers: user_id } }
       : { $addToSet: { followers: user_id } };
 
     await offers.updateOne(query, update);
+
     res.json({
       message: alreadyFollowing ? "Unfollowed" : "Followed",
       following: !alreadyFollowing,
