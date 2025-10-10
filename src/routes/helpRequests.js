@@ -33,6 +33,7 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
+      followers: [], // array of user_ids
       timestamp: new Date(),
     };
 
@@ -40,6 +41,28 @@ router.post("/", async (req, res) => {
     res.status(201).json({ id: result.insertedId.toString(), ...doc });
   } catch (error) {
     console.error("❌ Error creating help request:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/**
+ * GET /api/help-requests
+ * Returns all help requests (most recent first)
+ */
+router.get("/", async (req, res) => {
+  try {
+    const db = getDB();
+    const helpRequests = db.collection("help_requests");
+
+    const results = await helpRequests
+      .find({})
+      .sort({ timestamp: -1 })
+      .limit(100)
+      .toArray();
+
+    res.json(results.map((r) => ({ ...r, _id: r._id.toString() })));
+  } catch (error) {
+    console.error("❌ Error fetching help requests:", error);
     res.status(500).json({ error: "Internal server error." });
   }
 });
@@ -167,6 +190,98 @@ router.patch("/:id/resolve", async (req, res) => {
     res.json({ message: "Help request resolved." });
   } catch (error) {
     console.error("❌ Error resolving help request:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/**
+ * PATCH /api/help-requests/:id/follow
+ * Toggle following/unfollowing for a user
+ */
+router.patch("/:id/follow", async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: "user_id is required." });
+
+    const db = getDB();
+    const helpRequests = db.collection("help_requests");
+    const { id } = req.params;
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
+
+    const doc = await helpRequests.findOne(query);
+    if (!doc) return res.status(404).json({ error: "Help request not found." });
+
+    const alreadyFollowing = doc.followers?.includes(user_id);
+    const update = alreadyFollowing
+      ? { $pull: { followers: user_id } }
+      : { $addToSet: { followers: user_id } };
+
+    await helpRequests.updateOne(query, update);
+
+    res.json({
+      message: alreadyFollowing ? "Unfollowed" : "Followed",
+      following: !alreadyFollowing,
+    });
+  } catch (error) {
+    console.error("❌ Error toggling follow:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/**
+ * POST /api/help-requests/:id/comments
+ * Add a comment/update to a help request
+ */
+router.post("/:id/comments", async (req, res) => {
+  try {
+    const { user_id, text } = req.body;
+    if (!text) return res.status(400).json({ error: "Comment text is required." });
+
+    const db = getDB();
+    const comments = db.collection("help_comments");
+    const helpRequests = db.collection("help_requests");
+    const { id } = req.params;
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
+
+    const helpDoc = await helpRequests.findOne(query);
+    if (!helpDoc) return res.status(404).json({ error: "Help request not found." });
+
+    const comment = {
+      help_request_id: helpDoc._id,
+      user_id: user_id || null,
+      text,
+      createdAt: new Date(),
+    };
+
+    const result = await comments.insertOne(comment);
+    res.status(201).json({ id: result.insertedId.toString(), ...comment });
+  } catch (error) {
+    console.error("❌ Error adding comment:", error);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/**
+ * GET /api/help-requests/:id/comments
+ * Fetch all comments for a help request
+ */
+router.get("/:id/comments", async (req, res) => {
+  try {
+    const db = getDB();
+    const comments = db.collection("help_comments");
+    const { id } = req.params;
+    const filter = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { help_request_id: new ObjectId(id) }
+      : { help_request_id: id };
+
+    const docs = await comments.find(filter).sort({ createdAt: 1 }).toArray();
+    res.json(docs.map((c) => ({ ...c, _id: c._id.toString() })));
+  } catch (error) {
+    console.error("❌ Error fetching comments:", error);
     res.status(500).json({ error: "Internal server error." });
   }
 });
