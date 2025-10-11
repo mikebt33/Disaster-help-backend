@@ -3,27 +3,24 @@ import { XMLParser } from "fast-xml-parser";
 import { getDB } from "../db.js";
 
 /**
- * CAP Alert Poller Service — universal NWS / FEMA / USGS
- * Fetches CAP feeds, normalizes data, ensures geometry, and stores in MongoDB.
+ * CAP Alert Poller Service — NWS / FEMA / USGS
+ * Fetches CAP feeds, normalizes, saves geometry + bbox for map rendering.
  */
 
 const CAP_FEEDS = [
   { name: "NWS National Feed", url: "https://alerts.weather.gov/cap/us.php?x=0", source: "NWS" },
   { name: "FEMA IPAWS", url: "https://ipaws.nws.noaa.gov/feeds/IPAWSOpenCAP.xml", source: "FEMA" },
   { name: "USGS Earthquakes", url: "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.atom", source: "USGS" },
-
-  // --- State-level NOAA feeds (add more as needed) ---
+  // --- State-level NOAA feeds ---
   ...[
     "AL","AK","AZ","AR","CA","CO","CT","DE","DC","FL","GA","HI","ID","IL","IN","IA","KS","KY",
     "LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH",
     "OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","PR","GU","AS","MP","VI"
-  ].map(
-    (s) => ({
-      name: `${s} NWS Feed`,
-      url: `https://alerts.weather.gov/cap/${s.toLowerCase()}.php?x=0`,
-      source: "NWS",
-    })
-  ),
+  ].map((s) => ({
+    name: `${s} NWS Feed`,
+    url: `https://alerts.weather.gov/cap/${s.toLowerCase()}.php?x=0`,
+    source: "NWS",
+  })),
 ];
 
 /** Convert polygon strings into GeoJSON Polygon */
@@ -65,7 +62,7 @@ function polygonCentroid(geometry) {
   return { type: "Point", coordinates: [lon * (180 / Math.PI), lat * (180 / Math.PI)] };
 }
 
-/** State centroid fallback for text-only alerts */
+/** Fallback centers for state-level alerts */
 const STATE_CENTERS = {
   FL: [-81.5158, 27.6648], TX: [-99.9018, 31.9686], CA: [-119.4179, 36.7783],
   NY: [-75.4999, 43.0003], NC: [-79.0193, 35.7596], VA: [-78.6569, 37.4316],
@@ -84,7 +81,7 @@ const STATE_CENTERS = {
   NM: [-105.8701, 34.5199], WY: [-107.2903, 43.0759], ID: [-114.7420, 44.0682],
   UT: [-111.0937, 39.3200], AK: [-152.4044, 64.2008], HI: [-155.5828, 19.8968],
   PR: [-66.5901, 18.2208], GU: [144.7937, 13.4443], VI: [-64.8963, 18.3358],
-  US: [-98.5795, 39.8283]
+  US: [-98.5795, 39.8283],
 };
 
 /** Normalize and enrich one alert */
@@ -101,23 +98,23 @@ function normalizeCapAlert(entry, source) {
     const polygonGeom = parsePolygon(polygonRaw);
     let geometry = polygonGeom ? polygonCentroid(polygonGeom) : null;
 
-    // fallback lat/lon
+    // Fallback lat/lon
     const lat = parseFloat(info?.lat || area?.lat);
     const lon = parseFloat(info?.lon || area?.lon);
     if (!geometry && !isNaN(lat) && !isNaN(lon)) {
       geometry = { type: "Point", coordinates: [lon, lat] };
     }
 
-    // fallback by state center if nothing else
+    // Fallback by state center if nothing else
     if (!geometry) {
       const desc = area?.areaDesc || root?.areaDesc || "";
-      const stateMatch = desc.match(/\b([A-Z]{2})\b/);
-      const state = stateMatch?.[1];
+      const match = desc.match(/\b([A-Z]{2})\b/);
+      const state = match?.[1];
       const coords = STATE_CENTERS[state] || STATE_CENTERS.US;
-      geometry = { type: "Point", coordinates: coords, note: `approximation for ${desc}` };
+      geometry = { type: "Point", coordinates: coords };
     }
 
-    // bbox if polygon exists
+    // Bbox if polygon exists
     let bbox = null;
     if (polygonGeom?.coordinates?.[0]?.length > 2) {
       const pts = polygonGeom.coordinates[0];
@@ -154,6 +151,7 @@ function normalizeCapAlert(entry, source) {
       summary: root.summary || info?.description || info?.headline || "",
       source,
       timestamp: new Date(),
+      expires: info?.expires || root?.expires || null,
     };
   } catch (err) {
     console.error("❌ Error normalizing CAP alert:", err.message);
@@ -161,16 +159,26 @@ function normalizeCapAlert(entry, source) {
   }
 }
 
-/** Save parsed alerts into MongoDB */
+/** Save parsed alerts into MongoDB (with geometry + bbox) */
 async function saveAlerts(alerts) {
   try {
     const db = getDB();
     const collection = db.collection("alerts_cap");
 
     for (const alert of alerts) {
+      const doc = { ...alert };
+
+      // ✅ Guarantee geometry/bbox are saved
+      if (alert.geometry) doc.geometry = alert.geometry;
+      if (alert.bbox) doc.bbox = alert.bbox;
+
+      // Cleanup older ones (72 hours)
+      const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000);
+      await collection.deleteMany({ sent: { $lt: cutoff } });
+
       await collection.updateOne(
         { identifier: alert.identifier },
-        { $set: alert },
+        { $set: doc },
         { upsert: true }
       );
     }
@@ -191,7 +199,7 @@ async function fetchCapFeed(feed) {
     const json = parser.parse(xml);
 
     let entries = json.alert ? [json.alert] : json.feed?.entry || [];
-    if (!Array.isArray(entries)) entries = [entries]; // guard single entry
+    if (!Array.isArray(entries)) entries = [entries];
 
     const alerts = entries.map((e) => normalizeCapAlert(e, feed.source)).filter(Boolean);
 
