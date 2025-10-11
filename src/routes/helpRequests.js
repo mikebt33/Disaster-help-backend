@@ -9,11 +9,13 @@ const router = express.Router();
 /**
  * POST /api/help-requests
  * Create a new help request
+ * ✅ Now includes emergency flag
  * ✅ Triggers geo-based notifications to nearby users
  */
 router.post("/", async (req, res) => {
   try {
-    const { user_id, type, message, lat, lng } = req.body;
+    // ✅ Accept emergency flag from body
+    const { user_id, type, message, lat, lng, emergency } = req.body;
 
     if (!lat || !lng) {
       return res.status(400).json({ error: "Latitude (lat) and longitude (lng) are required." });
@@ -30,6 +32,7 @@ router.post("/", async (req, res) => {
         type: "Point",
         coordinates: [parseFloat(lng), parseFloat(lat)],
       },
+      emergency: emergency === true || emergency === "true", // ✅ store emergency flag
       status: "open",
       confirmCount: 0,
       disputeCount: 0,
@@ -162,7 +165,6 @@ router.patch("/:id/confirm", async (req, res) => {
 
     await helpRequests.updateOne(query, update);
 
-    // ✅ Notify followers of the update (no geofence)
     setImmediate(() =>
       notifyFollowersOfUpdate("help_requests", id, user_id, "confirm", "A help request was confirmed.")
     );
@@ -209,7 +211,6 @@ router.patch("/:id/dispute", async (req, res) => {
 
     await helpRequests.updateOne(query, update);
 
-    // ✅ Notify followers of the update
     setImmediate(() =>
       notifyFollowersOfUpdate("help_requests", id, user_id, "dispute", "A help request was disputed.")
     );
@@ -239,7 +240,6 @@ router.patch("/:id/resolve", async (req, res) => {
     if (result.matchedCount === 0)
       return res.status(404).json({ error: "Help request not found." });
 
-    // ✅ Notify followers of resolve event
     setImmediate(() =>
       notifyFollowersOfUpdate("help_requests", id, null, "resolve", "A followed help request has been marked as resolved.")
     );
@@ -316,7 +316,6 @@ router.post("/:id/comments", async (req, res) => {
 
     const result = await comments.insertOne(comment);
 
-    // ✅ Notify followers of new comment/update
     setImmediate(() =>
       notifyFollowersOfUpdate("help_requests", id, user_id, "comment", text)
     );
