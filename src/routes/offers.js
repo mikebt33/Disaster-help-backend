@@ -9,22 +9,33 @@ const router = express.Router();
 /**
  * POST /api/offers
  * Create a new offer
+ * ✅ Adds `type` for frontend compatibility
  * ✅ Triggers geo-based notifications for nearby users
  */
 router.post("/", async (req, res) => {
   try {
-    const { user_id, capabilities, message, lat, lng, available_until } = req.body;
-    if (!lat || !lng)
+    const { user_id, capabilities, type, message, lat, lng, available_until } = req.body;
+
+    if (!lat || !lng) {
       return res.status(400).json({ error: "Latitude and longitude are required." });
+    }
 
     const db = getDB();
     const offers = db.collection("offer_help");
 
+    const typeValue = Array.isArray(capabilities)
+      ? capabilities.join(", ")
+      : type || "Unspecified";
+
     const doc = {
       user_id: user_id || null,
-      capabilities: capabilities || [],
+      type: typeValue, // ✅ ensures field exists for app
+      capabilities: Array.isArray(capabilities) ? capabilities : typeValue.split(", "),
       message: message || "",
-      location: { type: "Point", coordinates: [parseFloat(lng), parseFloat(lat)] },
+      location: {
+        type: "Point",
+        coordinates: [parseFloat(lng), parseFloat(lat)],
+      },
       available_until: available_until ? new Date(available_until) : null,
       confirmCount: 0,
       disputeCount: 0,
@@ -76,8 +87,9 @@ router.get("/near", async (req, res) => {
     const lng = parseFloat(req.query.lng);
     const radiusKm = parseFloat(req.query.radius_km || 5);
 
-    if (isNaN(lat) || isNaN(lng))
+    if (isNaN(lat) || isNaN(lng)) {
       return res.status(400).json({ error: "Valid lat and lng required." });
+    }
 
     const db = getDB();
     const offers = db.collection("offer_help");
@@ -156,7 +168,6 @@ router.patch("/:id/confirm", async (req, res) => {
 
     await offers.updateOne(query, update);
 
-    // ✅ Notify followers of update (no geofence)
     setImmediate(() =>
       notifyFollowersOfUpdate("offer_help", id, user_id, "confirm", "An offer was confirmed.")
     );
@@ -203,7 +214,6 @@ router.patch("/:id/dispute", async (req, res) => {
 
     await offers.updateOne(query, update);
 
-    // ✅ Notify followers of update
     setImmediate(() =>
       notifyFollowersOfUpdate("offer_help", id, user_id, "dispute", "An offer was disputed.")
     );
@@ -233,7 +243,6 @@ router.patch("/:id/resolve", async (req, res) => {
     if (result.matchedCount === 0)
       return res.status(404).json({ error: "Offer not found." });
 
-    // ✅ Notify followers of resolve event
     setImmediate(() =>
       notifyFollowersOfUpdate("offer_help", id, null, "resolve", "A followed offer has been marked as resolved.")
     );
@@ -310,7 +319,6 @@ router.post("/:id/comments", async (req, res) => {
 
     const result = await comments.insertOne(comment);
 
-    // ✅ Notify followers of new comment/update
     setImmediate(() =>
       notifyFollowersOfUpdate("offer_help", id, user_id, "comment", text)
     );
