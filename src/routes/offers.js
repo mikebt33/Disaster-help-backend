@@ -50,7 +50,8 @@ router.post("/", async (req, res) => {
     // ✅ Geo-based notifications
     setImmediate(async () => {
       try {
-        await notifyNearbyUsers("offer_help", { ...doc, _id: result.insertedId });
+        await notifyNearbyUsers("offer_help", { ...doc, _id: result.insertedId }, doc.user_id);
+
       } catch (err) {
         console.error("❌ notifyNearbyUsers failed:", err);
       }
