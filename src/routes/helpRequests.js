@@ -9,12 +9,11 @@ const router = express.Router();
 /**
  * POST /api/help-requests
  * Create a new help request
- * ✅ Now includes emergency flag
- * ✅ Triggers geo-based notifications to nearby users
+ * ✅ Includes emergency flag
+ * ✅ Triggers geo-based notifications to nearby users (skipping creator)
  */
 router.post("/", async (req, res) => {
   try {
-    // ✅ Accept emergency flag from body
     const { user_id, type, message, lat, lng, emergency } = req.body;
 
     if (!lat || !lng) {
@@ -32,7 +31,7 @@ router.post("/", async (req, res) => {
         type: "Point",
         coordinates: [parseFloat(lng), parseFloat(lat)],
       },
-      emergency: emergency === true || emergency === "true", // ✅ store emergency flag
+      emergency: emergency === true || emergency === "true",
       status: "open",
       confirmCount: 0,
       disputeCount: 0,
@@ -44,11 +43,14 @@ router.post("/", async (req, res) => {
 
     const result = await helpRequests.insertOne(doc);
 
-    // ✅ Fire nearby notifications asynchronously
+    // ✅ Geo-based push notifications (skip notifying the creator)
     setImmediate(async () => {
       try {
-        await notifyNearbyUsers("help_requests", { ...doc, _id: result.insertedId }, doc.user_id);
-
+        await notifyNearbyUsers(
+          "help_requests",
+          { ...doc, _id: result.insertedId },
+          { excludeUserId: doc.user_id } // ✅ skip sender device
+        );
       } catch (e) {
         console.error("❌ notifyNearbyUsers failed:", e);
       }
@@ -91,6 +93,7 @@ router.get("/near", async (req, res) => {
 
     const db = getDB();
     const helpRequests = db.collection("help_requests");
+
     const results = await helpRequests
       .find({
         location: {
@@ -166,6 +169,7 @@ router.patch("/:id/confirm", async (req, res) => {
 
     await helpRequests.updateOne(query, update);
 
+    // ✅ Notify followers of update
     setImmediate(() =>
       notifyFollowersOfUpdate("help_requests", id, user_id, "confirm", "A help request was confirmed.")
     );
@@ -212,6 +216,7 @@ router.patch("/:id/dispute", async (req, res) => {
 
     await helpRequests.updateOne(query, update);
 
+    // ✅ Notify followers of update
     setImmediate(() =>
       notifyFollowersOfUpdate("help_requests", id, user_id, "dispute", "A help request was disputed.")
     );
@@ -241,6 +246,7 @@ router.patch("/:id/resolve", async (req, res) => {
     if (result.matchedCount === 0)
       return res.status(404).json({ error: "Help request not found." });
 
+    // ✅ Notify followers of resolve event
     setImmediate(() =>
       notifyFollowersOfUpdate("help_requests", id, null, "resolve", "A followed help request has been marked as resolved.")
     );
@@ -317,6 +323,7 @@ router.post("/:id/comments", async (req, res) => {
 
     const result = await comments.insertOne(comment);
 
+    // ✅ Notify followers of new comment
     setImmediate(() =>
       notifyFollowersOfUpdate("help_requests", id, user_id, "comment", text)
     );
