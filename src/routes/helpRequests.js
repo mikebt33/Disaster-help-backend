@@ -47,7 +47,8 @@ router.post("/", async (req, res) => {
     // ✅ Fire nearby notifications asynchronously
     setImmediate(async () => {
       try {
-        await notifyNearbyUsers("help_requests", { ...doc, _id: result.insertedId });
+        await notifyNearbyUsers("help_requests", { ...doc, _id: result.insertedId }, doc.user_id);
+
       } catch (e) {
         console.error("❌ notifyNearbyUsers failed:", e);
       }
