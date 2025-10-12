@@ -44,7 +44,7 @@ router.post("/", async (req, res) => {
     // ✅ Geo-based push notifications
     setImmediate(async () => {
       try {
-        await notifyNearbyUsers("hazards", { ...doc, _id: result.insertedId });
+        await notifyNearbyUsers("hazards", { ...doc, _id: result.insertedId }, doc.user_id);
       } catch (e) {
         console.error("❌ notifyNearbyUsers failed:", e);
       }
