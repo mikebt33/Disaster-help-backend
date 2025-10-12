@@ -14,6 +14,7 @@ const router = express.Router();
 router.post("/", async (req, res) => {
   try {
     const { type, description, geometry, severity, source, user_id } = req.body;
+
     if (["NWS", "FEMA", "USGS"].includes(source)) {
       return res.status(400).json({ error: "Reserved source identifier." });
     }
@@ -41,10 +42,14 @@ router.post("/", async (req, res) => {
 
     const result = await hazards.insertOne(doc);
 
-    // ✅ Geo-based push notifications
+    // ✅ Geo-based push notifications (skip notifying creator)
     setImmediate(async () => {
       try {
-        await notifyNearbyUsers("hazards", { ...doc, _id: result.insertedId }, doc.user_id);
+        await notifyNearbyUsers(
+          "hazards",
+          { ...doc, _id: result.insertedId },
+          { excludeUserId: doc.user_id } // ✅ skip sender to avoid duplicate push
+        );
       } catch (e) {
         console.error("❌ notifyNearbyUsers failed:", e);
       }
@@ -81,8 +86,9 @@ router.get("/near", async (req, res) => {
     const lng = parseFloat(req.query.lng);
     const radiusKm = parseFloat(req.query.radius_km || 5);
 
-    if (isNaN(lat) || isNaN(lng))
+    if (isNaN(lat) || isNaN(lng)) {
       return res.status(400).json({ error: "Valid lat and lng required." });
+    }
 
     const db = getDB();
     const hazards = db.collection("hazards");
