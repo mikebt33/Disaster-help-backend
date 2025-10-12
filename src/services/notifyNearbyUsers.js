@@ -35,7 +35,8 @@ function normalizeCollection(c) {
  * @param {string} collection - "hazards" | "help_requests" | "offer_help"
  * @param {object} doc - The new document that was inserted
  */
-export async function notifyNearbyUsers(collection, doc) {
+export async function notifyNearbyUsers(collection, doc, excludeUserId = null) {
+
   try {
     const db = getDB();
     const users = db.collection("users");
@@ -68,23 +69,20 @@ export async function notifyNearbyUsers(collection, doc) {
     }
 
     const eligible = [];
-    const creatorId = doc.user_id;
-
     for (const u of candidates) {
       if (!u.lastLocation || !u.radiusMi) continue;
-      if (creatorId && u.user_id === creatorId) continue; // skip notifying creator
-
+      if (excludeUserId && u.user_id === excludeUserId) continue; // 🚫 skip sender
       const dist = haversineDistanceMi(
         u.lastLocation.lat,
         u.lastLocation.lng,
         eventLat,
         eventLng
       );
-
       if (!isNaN(dist) && dist <= u.radiusMi) {
         eligible.push(...(u.fcm_tokens || []));
       }
     }
+
 
     if (eligible.length === 0) {
       console.log(`ℹ️ No nearby users to notify for new ${collName} post.`);
