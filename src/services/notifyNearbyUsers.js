@@ -9,12 +9,25 @@
  *   ✅ Compute distance using Haversine formula
  *   ✅ Send FCM notifications to those inside the radius
  *   ✅ Clean invalid tokens automatically
+ *   ✅ Normalize collection names to match frontend expectations
  * -------------------------------------------------------------
  */
 
 import admin from "./firebaseAdmin.js";
 import { getDB } from "../db.js";
 import { haversineDistanceMi } from "../utils/geoUtils.js";
+
+/**
+ * Normalize collection names so mobile deeplink routing works properly.
+ */
+function normalizeCollection(c) {
+  const map = {
+    help_requests: "help-requests",
+    offer_help: "offers",
+    hazards: "hazards",
+  };
+  return map[c] || c;
+}
 
 /**
  * Notify all users within their configured radius of a new event.
@@ -26,10 +39,10 @@ export async function notifyNearbyUsers(collection, doc) {
   try {
     const db = getDB();
     const users = db.collection("users");
+    const collName = normalizeCollection(collection);
 
     // 🔍 Extract event location
-    let eventLat = 0,
-      eventLng = 0;
+    let eventLat = 0, eventLng = 0;
     if (doc.geometry?.coordinates?.length >= 2) {
       [eventLng, eventLat] = doc.geometry.coordinates;
     } else if (doc.location?.coordinates?.length >= 2) {
@@ -39,7 +52,7 @@ export async function notifyNearbyUsers(collection, doc) {
       return;
     }
 
-    // 🧭 Fetch all users with location + radius
+    // 🧭 Fetch all users with location + radius + FCM
     const candidates = await users
       .find({
         lastLocation: { $exists: true },
@@ -55,8 +68,11 @@ export async function notifyNearbyUsers(collection, doc) {
     }
 
     const eligible = [];
+    const creatorId = doc.user_id;
+
     for (const u of candidates) {
       if (!u.lastLocation || !u.radiusMi) continue;
+      if (creatorId && u.user_id === creatorId) continue; // skip notifying creator
 
       const dist = haversineDistanceMi(
         u.lastLocation.lat,
@@ -71,40 +87,46 @@ export async function notifyNearbyUsers(collection, doc) {
     }
 
     if (eligible.length === 0) {
-      console.log(`ℹ️ No nearby users to notify for new ${collection} post.`);
+      console.log(`ℹ️ No nearby users to notify for new ${collName} post.`);
       return;
     }
 
+    console.log(
+      `🧭 Event @ (${eventLat.toFixed(4)}, ${eventLng.toFixed(4)}) — notifying ${eligible.length} devices`
+    );
+
+    // 🧠 Dynamic title + body
     const titleMap = {
       hazards: "⚠️ New Hazard Reported Nearby",
-      help_requests: "🚨 Help Request Near You",
-      offer_help: "💚 Offer to Help in Your Area",
+      "help-requests": "🚨 Help Request Near You",
+      offers: "💚 Offer to Help in Your Area",
     };
 
-    const title = titleMap[collection] || "📍 New Update in Your Area";
+    const title = titleMap[collName] || "📍 New Update in Your Area";
     const body =
       doc.description ||
       doc.message ||
       doc.type ||
       "A new report has been posted near your location.";
 
+    // 📦 FCM message payload
     const message = {
       notification: { title, body },
       data: {
-        deeplink: `disasterhelp://detail?c=${collection}&id=${doc._id}`,
-        collection,
+        deeplink: `disasterhelp://detail?c=${collName}&id=${doc._id}`,
+        collection: collName,
         docId: doc._id.toString(),
       },
       tokens: eligible,
     };
 
+    // 📲 Send notifications
     const response = await admin.messaging().sendEachForMulticast(message);
-
     console.log(
       `📤 Geo-notification sent to ${eligible.length} devices (success: ${response.successCount}, failed: ${response.failureCount})`
     );
 
-    // 🧹 Clean up invalid tokens
+    // 🧹 Clean invalid tokens
     const invalidTokens = [];
     response.responses.forEach((r, i) => {
       if (!r.success) {
