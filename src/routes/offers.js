@@ -10,7 +10,7 @@ const router = express.Router();
  * POST /api/offers
  * Create a new offer
  * ✅ Adds `type` for frontend compatibility
- * ✅ Triggers geo-based notifications for nearby users
+ * ✅ Triggers geo-based notifications for nearby users (skips creator)
  */
 router.post("/", async (req, res) => {
   try {
@@ -29,8 +29,10 @@ router.post("/", async (req, res) => {
 
     const doc = {
       user_id: user_id || null,
-      type: typeValue, // ✅ ensures field exists for app
-      capabilities: Array.isArray(capabilities) ? capabilities : typeValue.split(", "),
+      type: typeValue,
+      capabilities: Array.isArray(capabilities)
+        ? capabilities
+        : typeValue.split(", "),
       message: message || "",
       location: {
         type: "Point",
@@ -47,11 +49,14 @@ router.post("/", async (req, res) => {
 
     const result = await offers.insertOne(doc);
 
-    // ✅ Geo-based notifications
+    // ✅ Geo-based notifications (skip notifying creator)
     setImmediate(async () => {
       try {
-        await notifyNearbyUsers("offer_help", { ...doc, _id: result.insertedId }, doc.user_id);
-
+        await notifyNearbyUsers(
+          "offer_help",
+          { ...doc, _id: result.insertedId },
+          { excludeUserId: doc.user_id } // ✅ prevents duplicate push to sender
+        );
       } catch (err) {
         console.error("❌ notifyNearbyUsers failed:", err);
       }
@@ -94,6 +99,7 @@ router.get("/near", async (req, res) => {
 
     const db = getDB();
     const offers = db.collection("offer_help");
+
     const results = await offers
       .find({
         location: {
@@ -121,9 +127,10 @@ router.get("/:id", async (req, res) => {
     const db = getDB();
     const offers = db.collection("offer_help");
     const { id } = req.params;
-    const query = /^[0-9a-fA-F]{24}$/.test(id)
-      ? { _id: new ObjectId(id) }
-      : { _id: id };
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(id)
+        ? { _id: new ObjectId(id) }
+        : { _id: id };
 
     const doc = await offers.findOne(query);
     if (!doc) return res.status(404).json({ error: "Offer not found." });
@@ -145,9 +152,10 @@ router.patch("/:id/confirm", async (req, res) => {
     const db = getDB();
     const offers = db.collection("offer_help");
     const { id } = req.params;
-    const query = /^[0-9a-fA-F]{24}$/.test(id)
-      ? { _id: new ObjectId(id) }
-      : { _id: id };
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(id)
+        ? { _id: new ObjectId(id) }
+        : { _id: id };
 
     const doc = await offers.findOne(query);
     if (!doc) return res.status(404).json({ error: "Offer not found." });
@@ -191,9 +199,10 @@ router.patch("/:id/dispute", async (req, res) => {
     const db = getDB();
     const offers = db.collection("offer_help");
     const { id } = req.params;
-    const query = /^[0-9a-fA-F]{24}$/.test(id)
-      ? { _id: new ObjectId(id) }
-      : { _id: id };
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(id)
+        ? { _id: new ObjectId(id) }
+        : { _id: id };
 
     const doc = await offers.findOne(query);
     if (!doc) return res.status(404).json({ error: "Offer not found." });
@@ -234,9 +243,10 @@ router.patch("/:id/resolve", async (req, res) => {
     const db = getDB();
     const offers = db.collection("offer_help");
     const { id } = req.params;
-    const query = /^[0-9a-fA-F]{24}$/.test(id)
-      ? { _id: new ObjectId(id) }
-      : { _id: id };
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(id)
+        ? { _id: new ObjectId(id) }
+        : { _id: id };
 
     const result = await offers.updateOne(query, {
       $set: { resolved: true, resolvedAt: new Date() },
@@ -266,9 +276,10 @@ router.patch("/:id/follow", async (req, res) => {
     const db = getDB();
     const offers = db.collection("offer_help");
     const { id } = req.params;
-    const query = /^[0-9a-fA-F]{24}$/.test(id)
-      ? { _id: new ObjectId(id) }
-      : { _id: id };
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(id)
+        ? { _id: new ObjectId(id) }
+        : { _id: id };
 
     const doc = await offers.findOne(query);
     if (!doc) return res.status(404).json({ error: "Offer not found." });
@@ -304,9 +315,10 @@ router.post("/:id/comments", async (req, res) => {
     const comments = db.collection("offer_comments");
     const offers = db.collection("offer_help");
     const { id } = req.params;
-    const query = /^[0-9a-fA-F]{24}$/.test(id)
-      ? { _id: new ObjectId(id) }
-      : { _id: id };
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(id)
+        ? { _id: new ObjectId(id) }
+        : { _id: id };
 
     const offerDoc = await offers.findOne(query);
     if (!offerDoc) return res.status(404).json({ error: "Offer not found." });
@@ -339,9 +351,10 @@ router.get("/:id/comments", async (req, res) => {
     const db = getDB();
     const comments = db.collection("offer_comments");
     const { id } = req.params;
-    const filter = /^[0-9a-fA-F]{24}$/.test(id)
-      ? { offer_id: new ObjectId(id) }
-      : { offer_id: id };
+    const filter =
+      /^[0-9a-fA-F]{24}$/.test(id)
+        ? { offer_id: new ObjectId(id) }
+        : { offer_id: id };
 
     const docs = await comments.find(filter).sort({ createdAt: 1 }).toArray();
     res.json(docs.map((c) => ({ ...c, _id: c._id.toString() })));
@@ -359,13 +372,16 @@ router.delete("/:id", async (req, res) => {
     const db = getDB();
     const offers = db.collection("offer_help");
     const { id } = req.params;
-    const query = /^[0-9a-fA-F]{24}$/.test(id)
-      ? { _id: new ObjectId(id) }
-      : { _id: id };
+    const query =
+      /^[0-9a-fA-F]{24}$/.test(id)
+        ? { _id: new ObjectId(id) }
+        : { _id: id };
 
     const result = await offers.deleteOne(query);
     if (result.deletedCount === 0)
-      return res.status(404).json({ error: "Offer not found or already deleted." });
+      return res
+        .status(404)
+        .json({ error: "Offer not found or already deleted." });
     res.json({ message: "Offer deleted successfully." });
   } catch (error) {
     console.error("❌ Error deleting offer:", error);
