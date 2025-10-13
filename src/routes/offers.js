@@ -10,7 +10,8 @@ const router = express.Router();
  * POST /api/offers
  * Create a new offer
  * ✅ Adds `type` for frontend compatibility
- * ✅ Triggers geo-based notifications for nearby users (skips creator)
+ * ✅ Triggers geo-based notifications for nearby users
+ * ✅ Skips creator + dedupe guard
  */
 router.post("/", async (req, res) => {
   try {
@@ -42,21 +43,19 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
-      followers: user_id ? [user_id] : [], // ✅ auto-follow creator
+      followers: user_id ? [user_id] : [],
       votes: {},
       timestamp: new Date(),
     };
 
     const result = await offers.insertOne(doc);
+    const inserted = { ...doc, _id: result.insertedId };
 
-    // ✅ Geo-based notifications (skip notifying creator)
+    // ✅ Geo push (dedupe-safe, skip creator)
     setImmediate(async () => {
       try {
-        await notifyNearbyUsers(
-          "offer_help",
-          { ...doc, _id: result.insertedId },
-          { excludeUserId: doc.user_id } // ✅ prevents duplicate push to sender
-        );
+        await notifyNearbyUsers("offer_help", inserted, { excludeUserId: doc.user_id });
+        console.log(`📡 notifyNearbyUsers fired for offer ${result.insertedId}`);
       } catch (err) {
         console.error("❌ notifyNearbyUsers failed:", err);
       }

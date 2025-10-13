@@ -10,6 +10,8 @@ const router = express.Router();
  * POST /api/hazards
  * Create a new hazard
  * ✅ Triggers geo-based notifications for users near the hazard
+ * ✅ Skips creator
+ * ✅ Debounces duplicate sends
  */
 router.post("/", async (req, res) => {
   try {
@@ -18,7 +20,7 @@ router.post("/", async (req, res) => {
     if (["NWS", "FEMA", "USGS"].includes(source)) {
       return res.status(400).json({ error: "Reserved source identifier." });
     }
-    if (!geometry || !geometry.type || !geometry.coordinates) {
+    if (!geometry?.type || !geometry?.coordinates?.length) {
       return res.status(400).json({ error: "Valid geometry is required." });
     }
 
@@ -35,23 +37,21 @@ router.post("/", async (req, res) => {
       confirmCount: 0,
       disputeCount: 0,
       resolved: false,
-      followers: user_id ? [user_id] : [], // ✅ auto-follow creator
+      followers: user_id ? [user_id] : [],
       votes: {},
       timestamp: new Date(),
     };
 
     const result = await hazards.insertOne(doc);
+    const inserted = { ...doc, _id: result.insertedId };
 
-    // ✅ Geo-based push notifications (skip notifying creator)
+    // ✅ Geo-based push notifications (skip creator, dedupe-safe)
     setImmediate(async () => {
       try {
-        await notifyNearbyUsers(
-          "hazards",
-          { ...doc, _id: result.insertedId },
-          { excludeUserId: doc.user_id } // ✅ skip sender to avoid duplicate push
-        );
-      } catch (e) {
-        console.error("❌ notifyNearbyUsers failed:", e);
+        await notifyNearbyUsers("hazards", inserted, { excludeUserId: doc.user_id });
+        console.log(`📡 notifyNearbyUsers fired for hazard ${result.insertedId}`);
+      } catch (err) {
+        console.error("❌ notifyNearbyUsers failed:", err);
       }
     });
 
@@ -166,7 +166,6 @@ router.patch("/:id/confirm", async (req, res) => {
 
     await hazards.updateOne(query, update);
 
-    // ✅ Notify followers of update
     setImmediate(() =>
       notifyFollowersOfUpdate("hazards", id, user_id, "confirm", "A hazard was confirmed.")
     );
@@ -212,7 +211,6 @@ router.patch("/:id/dispute", async (req, res) => {
 
     await hazards.updateOne(query, update);
 
-    // ✅ Notify followers of update
     setImmediate(() =>
       notifyFollowersOfUpdate("hazards", id, user_id, "dispute", "A hazard was disputed.")
     );
@@ -241,9 +239,14 @@ router.patch("/:id/resolve", async (req, res) => {
     if (result.matchedCount === 0)
       return res.status(404).json({ error: "Hazard not found." });
 
-    // ✅ Notify followers of resolve event
     setImmediate(() =>
-      notifyFollowersOfUpdate("hazards", id, null, "resolve", "A followed hazard has been marked as resolved.")
+      notifyFollowersOfUpdate(
+        "hazards",
+        id,
+        null,
+        "resolve",
+        "A followed hazard has been marked as resolved."
+      )
     );
 
     res.json({ message: "Hazard resolved." });
@@ -316,7 +319,6 @@ router.post("/:id/comments", async (req, res) => {
 
     const result = await comments.insertOne(comment);
 
-    // ✅ Notify followers of comment/update
     setImmediate(() =>
       notifyFollowersOfUpdate("hazards", id, user_id, "comment", text)
     );
