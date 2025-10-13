@@ -8,7 +8,7 @@
  */
 
 import express from "express";
-import { registerFcmToken, notifyFollowers } from "../services/notifications.js";
+import { registerFcmToken } from "../services/notifications.js";
 
 const router = express.Router();
 
