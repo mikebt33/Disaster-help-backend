@@ -1,7 +1,7 @@
 import express from "express";
 import { getDB } from "../db.js";
 import { ObjectId } from "mongodb";
-import { notifyFollowers, notifyFollowersOfUpdate } from "../services/notifications.js";
+import { notifyFollowersOfUpdate } from "../services/notifications.js";
 import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js";
 
 const router = express.Router();
