@@ -6,10 +6,10 @@
  *
  * Improvements in this version:
  *   ✅ Deduplicate FCM tokens across all matched users
- *   ✅ Skip notifying the creator (optional)
- *   ✅ Event-level send guard (TTL) to avoid double-sends
- *   ✅ Android collapseKey + notification.tag to coalesce duplicates
- *   ✅ iOS apns-collapse-id to coalesce duplicates
+ *   ✅ Skip notifying the creator (excludeUserId)
+ *   ✅ In-process event-level send guard (TTL)
+ *   ✅ Android collapseKey + notification.tag coalesce duplicates
+ *   ✅ iOS apns-collapse-id coalesces duplicates
  *   ✅ Clean invalid tokens automatically
  * -------------------------------------------------------------
  */
@@ -18,14 +18,12 @@ import admin from "./firebaseAdmin.js";
 import { getDB } from "../db.js";
 import { haversineDistanceMi } from "../utils/geoUtils.js";
 
-// Simple in-process send guard to avoid sending the *same* event twice
-// If you run multiple server instances, move this to Redis.
+// 🧠 Local memory TTL (simple, works even without Redis)
 const recentlySent = new Map(); // key -> timestamp
-const TTL_MS = 60_000;          // 60s dedupe window
+const TTL_MS = 60_000; // 60 s dedupe window
 
 function _markSent(key) {
   recentlySent.set(key, Date.now());
-  // cleanup later to keep map small
   setTimeout(() => {
     const ts = recentlySent.get(key);
     if (ts && Date.now() - ts > TTL_MS) recentlySent.delete(key);
@@ -35,38 +33,40 @@ function _markSent(key) {
 /**
  * Notify all users within their configured radius of a new event.
  *
- * @param {string} collection - "hazards" | "help_requests" | "offer_help"
- * @param {object} doc - The newly created document; must contain _id and geometry/location
+ * @param {string} collection  - "hazards" | "help_requests" | "offer_help"
+ * @param {object} doc         - The newly created document
  * @param {object} [opts]
- * @param {string} [opts.excludeUserId] - user_id to exclude (usually the creator)
+ * @param {string} [opts.excludeUserId] - User to exclude (usually the creator)
  */
 export async function notifyNearbyUsers(collection, doc, opts = {}) {
   try {
     const db = getDB();
     const users = db.collection("users");
 
-    // Dedupe guard per event
+    // 🧩 Global event dedupe key
     const sendKey = `geo:${collection}:${doc._id}`;
     const last = recentlySent.get(sendKey);
     if (last && Date.now() - last < TTL_MS) {
-      console.log(`⏩ Skipping duplicate send for ${sendKey}`);
+      console.log(`⏩ Skipping duplicate geo-send for ${sendKey}`);
       return;
     }
 
-    // 🔎 Extract event location
-    let eventLat = 0, eventLng = 0;
+    // 🔍 Extract event location
+    let eventLat = 0,
+      eventLng = 0;
     if (doc?.geometry?.coordinates?.length >= 2) {
       [eventLng, eventLat] = doc.geometry.coordinates;
     } else if (doc?.location?.coordinates?.length >= 2) {
       [eventLng, eventLat] = doc.location.coordinates;
     } else if (typeof doc.lat === "number" && typeof doc.lng === "number") {
-      eventLat = doc.lat; eventLng = doc.lng;
+      eventLat = doc.lat;
+      eventLng = doc.lng;
     } else {
-      console.warn("⚠️ notifyNearbyUsers: Event missing geometry/location");
+      console.warn("⚠️ notifyNearbyUsers: event missing geometry/location");
       return;
     }
 
-    // 🧭 Fetch all users with location + radius + at least one token
+    // 🧭 Fetch all users with location + radius + FCM token
     const candidates = await users
       .find({
         lastLocation: { $exists: true },
@@ -77,11 +77,11 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       .toArray();
 
     if (!candidates.length) {
-      console.log("ℹ️ No users with location or FCM tokens found.");
+      console.log("ℹ️ No users with location or tokens found.");
       return;
     }
 
-    // ✅ Build a unique token set (dedupe across all user docs)
+    // ✅ Build deduped token set
     const excludeUserId = opts.excludeUserId ?? doc.user_id;
     const tokenSet = new Set();
 
@@ -96,7 +96,7 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
         eventLng
       );
       if (!isNaN(dist) && dist <= u.radiusMi) {
-        for (const t of (u.fcm_tokens || [])) {
+        for (const t of u.fcm_tokens || []) {
           if (typeof t === "string" && t.length > 10) tokenSet.add(t);
         }
       }
@@ -104,7 +104,7 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
 
     const tokens = Array.from(tokenSet);
     if (tokens.length === 0) {
-      console.log(`ℹ️ No nearby users to notify for new ${collection} post.`);
+      console.log(`ℹ️ No nearby users to notify for ${collection}.`);
       return;
     }
 
@@ -121,7 +121,8 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       doc.type ||
       "A new report has been posted near your location.";
 
-    const collapseKey = `geo_${collection}_${doc._id}`; // same key coalesces duplicates on device
+    // ✅ collapseKey ensures duplicate deliveries (system + local) merge
+    const collapseKey = `geo_${collection}_${doc._id}`;
 
     const message = {
       notification: { title, body },
@@ -130,33 +131,34 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
         collection,
         docId: String(doc._id),
       },
-      tokens,
       android: {
         priority: "high",
         collapseKey,
         notification: {
-          channelId: "alerts",        // match your Android channel
-          tag: collapseKey,           // coalesce in the notification tray
+          channelId: "alerts",
+          tag: collapseKey,
         },
       },
       apns: {
         headers: {
           "apns-priority": "10",
-          "apns-collapse-id": collapseKey, // coalesce on iOS
+          "apns-collapse-id": collapseKey,
         },
         payload: {
           aps: { sound: "default" },
         },
       },
+      tokens,
     };
 
+    // 📨 Send FCM
     const response = await admin.messaging().sendEachForMulticast(message);
     console.log(
-      `📤 Geo-notification sent to ${tokens.length} devices (success: ${response.successCount}, failed: ${response.failureCount})`
+      `📤 Geo-notif to ${tokens.length} devices (success: ${response.successCount}, failed: ${response.failureCount})`
     );
 
     // 🧹 Clean invalid tokens
-    const invalid = [];
+    const invalidTokens = [];
     response.responses.forEach((r, i) => {
       if (!r.success) {
         const code = r.error?.code || "unknown";
@@ -164,20 +166,19 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
           code === "messaging/invalid-registration-token" ||
           code === "messaging/registration-token-not-registered"
         ) {
-          invalid.push(tokens[i]);
+          invalidTokens.push(tokens[i]);
         }
       }
     });
 
-    if (invalid.length > 0) {
+    if (invalidTokens.length > 0) {
       await users.updateMany(
-        { fcm_tokens: { $in: invalid } },
-        { $pull: { fcm_tokens: { $in: invalid } } }
+        { fcm_tokens: { $in: invalidTokens } },
+        { $pull: { fcm_tokens: { $in: invalidTokens } } }
       );
-      console.log(`🧹 Removed ${invalid.length} invalid tokens.`);
+      console.log(`🧹 Removed ${invalidTokens.length} invalid tokens.`);
     }
 
-    // Mark this event sent (dedupe window)
     _markSent(sendKey);
   } catch (err) {
     console.error("❌ Error in notifyNearbyUsers:", err);

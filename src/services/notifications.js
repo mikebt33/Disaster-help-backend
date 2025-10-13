@@ -9,6 +9,7 @@
  *   ✅ Send notifications to followers (geo-filtered)
  *   ✅ Notify followers of updates (comments, resolves, etc.)
  *   ✅ Clean up invalid tokens automatically
+ *   ✅ Prevent duplicate notifications via collapse keys
  * -------------------------------------------------------------
  */
 
@@ -59,7 +60,9 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
 
     // ✅ Convert to ObjectId if valid
     const query =
-      /^[0-9a-fA-F]{24}$/.test(docId) ? { _id: new ObjectId(docId) } : { _id: docId };
+      /^[0-9a-fA-F]{24}$/.test(docId)
+        ? { _id: new ObjectId(docId) }
+        : { _id: docId };
 
     const post = await coll.findOne(query);
     if (!post) {
@@ -73,14 +76,15 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
       return;
     }
 
-    // 🔍 Determine event location
-    let eventLat = 0, eventLng = 0;
+    // 🔍 Determine event location (for radius filtering)
+    let eventLat = 0,
+      eventLng = 0;
     if (post.geometry?.coordinates?.length >= 2) {
       [eventLng, eventLat] = post.geometry.coordinates;
     } else if (post.location?.coordinates?.length >= 2) {
       [eventLng, eventLat] = post.location.coordinates;
     } else {
-      console.warn("⚠️ Event has no valid location geometry, skipping geo filter.");
+      console.warn("⚠️ Event has no valid geometry, skipping geo filter.");
     }
 
     // 🔎 Fetch follower profiles
@@ -111,6 +115,9 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
       return;
     }
 
+    // ✅ Add collapse keys to prevent duplicate system+local notifications
+    const collapseId = `${collection}_${docId}`;
+
     const message = {
       notification: { title, body },
       data: {
@@ -118,6 +125,16 @@ export async function notifyFollowers(collection, docId, title, body, data = {})
         collection,
         docId: docId.toString(),
         ...data,
+      },
+      android: {
+        collapseKey: collapseId,
+        priority: "high",
+      },
+      apns: {
+        headers: {
+          "apns-collapse-id": collapseId,
+          "apns-priority": "10",
+        },
       },
       tokens: eligibleTokens,
     };
@@ -148,14 +165,14 @@ export async function notifyFollowersOfUpdate(
     const db = getDB();
     const coll = db.collection(collection);
 
-    // ✅ Convert string ID → ObjectId
     const query =
-      /^[0-9a-fA-F]{24}$/.test(docId) ? { _id: new ObjectId(docId) } : { _id: docId };
+      /^[0-9a-fA-F]{24}$/.test(docId)
+        ? { _id: new ObjectId(docId) }
+        : { _id: docId };
 
     const post = await coll.findOne(query);
     if (!post) return console.warn(`⚠️ notifyFollowersOfUpdate: post ${docId} not found`);
 
-    // Skip notifying the actor
     const followerIds = (post.followers || []).filter((id) => id !== actorId);
     if (followerIds.length === 0) return;
 
@@ -177,6 +194,8 @@ export async function notifyFollowersOfUpdate(
     const title = `New ${eventType} on ${collection}`;
     const body = text || `${eventType} update on a post you follow`;
 
+    const collapseId = `${collection}_${docId}_${eventType}`;
+
     const message = {
       notification: { title, body },
       data: {
@@ -184,6 +203,16 @@ export async function notifyFollowersOfUpdate(
         collection,
         docId: docId.toString(),
         type: eventType,
+      },
+      android: {
+        collapseKey: collapseId,
+        priority: "high",
+      },
+      apns: {
+        headers: {
+          "apns-collapse-id": collapseId,
+          "apns-priority": "10",
+        },
       },
       tokens,
     };

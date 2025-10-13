@@ -9,7 +9,7 @@ import helpRoutes from "./src/routes/helpRequests.js";
 import offerRoutes from "./src/routes/offers.js";
 import hazardRoutes from "./src/routes/hazards.js";
 import alertRoutes from "./src/routes/alertsCap.js";
-import './src/services/notifications.js';
+import "./src/services/notifications.js";
 import userRoutes from "./src/routes/user.js";
 
 dotenv.config();
@@ -23,21 +23,81 @@ cron.schedule("0 2 * * *", async () => {
   await runCleanup();
 });
 
-// Connect to MongoDB and ensure indexes
+// ==============================
+// 🔗 Database Connection & Index Setup
+// ==============================
 await connectDB();
 const db = getDB();
+
+// 1️⃣ Core geospatial indexes
 await Promise.all([
   db.collection("hazards").createIndex({ geometry: "2dsphere" }),
   db.collection("alerts_cap").createIndex({ geometry: "2dsphere" }),
+  db.collection("help_requests").createIndex({ location: "2dsphere" }),
+  db.collection("offer_help").createIndex({ location: "2dsphere" }),
 ]);
 console.log("✅ Geospatial indexes ensured");
+
+// 2️⃣ TTL (Time-To-Live) indexes for automatic cleanup (72 hours)
+const ttlSeconds = 72 * 60 * 60; // 72 hours = 259,200 seconds
+await Promise.all([
+  db.collection("hazards").createIndex(
+    { timestamp: 1 },
+    { expireAfterSeconds: ttlSeconds }
+  ),
+  db.collection("help_requests").createIndex(
+    { timestamp: 1 },
+    { expireAfterSeconds: ttlSeconds }
+  ),
+  db.collection("offer_help").createIndex(
+    { timestamp: 1 },
+    { expireAfterSeconds: ttlSeconds }
+  ),
+]);
+console.log(`⏱️ TTL indexes set — data expires after ${ttlSeconds / 3600} hours.`);
+
+// 3️⃣ Schema validation — ensures consistent structure
+try {
+  await db.command({
+    collMod: "help_requests",
+    validator: {
+      $jsonSchema: {
+        bsonType: "object",
+        required: ["location", "timestamp"],
+        properties: {
+          location: {
+            bsonType: "object",
+            required: ["type", "coordinates"],
+            properties: {
+              type: { enum: ["Point"] },
+              coordinates: {
+                bsonType: "array",
+                items: [{ bsonType: "double" }],
+                minItems: 2,
+                maxItems: 2,
+              },
+            },
+          },
+          message: { bsonType: "string" },
+          timestamp: { bsonType: "date" },
+        },
+      },
+    },
+    validationLevel: "moderate",
+  });
+  console.log("✅ Schema validation applied for help_requests.");
+} catch (e) {
+  console.warn("⚠️ Schema validation skipped or already exists:", e.message);
+}
 
 // Optional: remove CAP alerts older than 7 days
 await db.collection("alerts_cap").deleteMany({
   sent: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
 });
 
-// Register routes
+// ==============================
+// 🧭 API Routes
+// ==============================
 app.use("/api/help-requests", helpRoutes);
 app.use("/api/offers", offerRoutes);
 app.use("/api/hazards", hazardRoutes);
