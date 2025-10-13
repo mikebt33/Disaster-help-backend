@@ -35,6 +35,7 @@ await Promise.all([
   db.collection("alerts_cap").createIndex({ geometry: "2dsphere" }),
   db.collection("help_requests").createIndex({ location: "2dsphere" }),
   db.collection("offer_help").createIndex({ location: "2dsphere" }),
+  db.collection("sent_events").createIndex({ lastSentAt: 1 }, { expireAfterSeconds: 120 }),
 ]);
 console.log("✅ Geospatial indexes ensured");
 
