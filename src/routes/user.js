@@ -1,68 +1,160 @@
-/**
- * /src/routes/user.js
- * -------------------------------------------------------------
- * REST endpoints for user-related operations:
- *   ✅ Register or update FCM tokens
- *   ✅ Manually trigger follower notifications
- * -------------------------------------------------------------
- */
-
 import express from "express";
+import { getDB } from "../db.js";
+import admin from "../services/firebaseAdmin.js";
 import { registerFcmToken } from "../services/notifications.js";
 
 const router = express.Router();
 
 /**
  * POST /api/user/register-token
- * Registers or updates an FCM token for a given device/user.
- * Expects JSON body: { "user_id": "abc123", "fcm_token": "token_here" }
+ * body: { user_id: string, fcm_token: string }
  */
 router.post("/register-token", async (req, res) => {
   try {
-    const { user_id, fcm_token } = req.body;
+    const { user_id, fcm_token } = req.body || {};
     if (!user_id || !fcm_token) {
-      return res
-        .status(400)
-        .json({ error: "user_id and fcm_token are required." });
+      return res.status(400).json({ error: "user_id and fcm_token are required" });
     }
-
-    const result = await registerFcmToken(user_id, fcm_token);
-    if (result.error) {
-      return res.status(500).json(result);
-    }
-
-    res.json(result);
-  } catch (err) {
-    console.error("❌ Error in /register-token:", err);
-    res.status(500).json({ error: "Internal server error." });
+    const r = await registerFcmToken(user_id, fcm_token);
+    if (r?.error) return res.status(500).json(r);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ register-token failed:", e);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
 /**
- * POST /api/user/notify-followers
- * Sends a push notification to all followers of a given post.
- * Expects JSON:
- *   {
- *     "collection": "hazards",
- *     "docId": "68e92423ba99259ddfb2e017",
- *     "title": "Severe Weather Update",
- *     "message": "Flash flood warning extended"
- *   }
+ * POST /api/user/location
+ * body: { user_id: string, lat: number, lng: number }
+ * Stores lastLocation for geofencing.
  */
-router.post("/notify-followers", async (req, res) => {
+router.post("/location", async (req, res) => {
   try {
-    const { collection, docId, title, message } = req.body;
-    if (!collection || !docId || !title || !message) {
-      return res.status(400).json({
-        error: "collection, docId, title, and message are required.",
-      });
+    const { user_id, lat, lng } = req.body || {};
+    if (!user_id || typeof lat !== "number" || typeof lng !== "number") {
+      return res.status(400).json({ error: "user_id, lat, lng are required" });
+    }
+    const db = getDB();
+    await db.collection("users").updateOne(
+      { user_id },
+      {
+        $set: {
+          lastLocation: { lat, lng },
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ /location failed:", e);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * PATCH /api/user/settings
+ * body: { user_id: string, radiusMi?: number, notificationsEnabled?: boolean }
+ */
+router.patch("/settings", async (req, res) => {
+  try {
+    const { user_id, radiusMi, notificationsEnabled } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: "user_id is required" });
+
+    const update = {};
+    if (typeof radiusMi === "number") update["radiusMi"] = radiusMi;
+    if (typeof notificationsEnabled === "boolean")
+      update["notificationsEnabled"] = notificationsEnabled;
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: "No valid fields to update" });
     }
 
-    await notifyFollowers(collection, docId, title, message);
-    res.json({ message: "✅ Notifications dispatched (check logs for results)" });
-  } catch (err) {
-    console.error("❌ Error in /notify-followers:", err);
-    res.status(500).json({ error: "Internal server error." });
+    const db = getDB();
+    await db.collection("users").updateOne(
+      { user_id },
+      { $set: { ...update, updatedAt: new Date() } },
+      { upsert: true }
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ /settings failed:", e);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * GET /api/user/me?user_id=abc
+ * Returns minimal profile for debugging geofence.
+ */
+router.get("/me", async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    if (!user_id) return res.status(400).json({ error: "user_id is required" });
+
+    const db = getDB();
+    const u = await db
+      .collection("users")
+      .findOne({ user_id }, { projection: { _id: 0 } });
+
+    res.json(u || {});
+  } catch (e) {
+    console.error("❌ /me failed:", e);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * POST /api/user/test-push
+ * body: { token?: string, user_id?: string, title?, body? }
+ * Sends a test push to a token or to all tokens of a user.
+ */
+router.post("/test-push", async (req, res) => {
+  try {
+    const { token, user_id, title, body } = req.body || {};
+    let tokens = [];
+
+    if (token) {
+      tokens = [token];
+    } else if (user_id) {
+      const db = getDB();
+      const u = await db.collection("users").findOne(
+        { user_id },
+        { projection: { fcm_tokens: 1 } }
+      );
+      tokens = (u?.fcm_tokens || []).filter(t => typeof t === "string" && t.length > 10);
+    } else {
+      return res.status(400).json({ error: "Provide token or user_id" });
+    }
+
+    if (tokens.length === 0) {
+      return res.status(400).json({ error: "No valid tokens found" });
+    }
+
+    const message = {
+      notification: {
+        title: title || "Test Notification",
+        body: body || "This is a test push from /api/user/test-push",
+      },
+      data: { deeplink: "disasterhelp://home" },
+      tokens,
+      android: { priority: "high", notification: { channelId: "alerts" } },
+      apns: { headers: { "apns-priority": "10" }, payload: { aps: { sound: "default" } } },
+    };
+
+    const resp = await admin.messaging().sendEachForMulticast(message);
+    res.json({
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
+      errors: resp.responses
+        .map((r, i) => (!r.success ? { token: tokens[i], code: r.error?.code } : null))
+        .filter(Boolean),
+    });
+  } catch (e) {
+    console.error("❌ /test-push failed:", e);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 

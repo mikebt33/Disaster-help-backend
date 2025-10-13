@@ -1,41 +1,60 @@
 /**
  * /src/services/notifyNearbyUsers.js
  * -------------------------------------------------------------
- * Geo-fence notifications when a new hazard/help/offer is created.
- * Now with:
- *   ✅ DB idempotency guard (works across processes)
- *   ✅ Token Set de-duplication
- *   ✅ Exclude creator
- *   ✅ collapseKey / tag / apns-collapse-id
- *   ✅ Invalid token cleanup
+ * Centralized geofence-based notification logic.
+ * Triggers when a new hazard/help/offer post is created.
+ *
+ * Improvements:
+ *   ✅ Deduplicate FCM tokens across all matched users
+ *   ✅ Skip notifying the creator (optional)
+ *   ✅ Event-level send guard (TTL) to avoid double-sends
+ *   ✅ Android collapseKey + notification.tag to coalesce duplicates
+ *   ✅ iOS apns-collapse-id to coalesce duplicates
+ *   ✅ Clean invalid tokens automatically
+ *   ✅ Robust logging + safe defaults for radius
  * -------------------------------------------------------------
  */
 
 import admin from "./firebaseAdmin.js";
 import { getDB } from "../db.js";
 import { haversineDistanceMi } from "../utils/geoUtils.js";
-import { shouldSendNow } from "./sendOnce.js";
+
+// --- In-memory send guard (use Redis if you run >1 instance) ---
+const recentlySent = new Map();            // key -> timestamp
+const TTL_MS = 60_000;                     // 60s dedupe window
+const DEFAULT_RADIUS_MI = Number(process.env.DEFAULT_RADIUS_MI || 10);
+
+function _markSent(key) {
+  recentlySent.set(key, Date.now());
+  setTimeout(() => {
+    const ts = recentlySent.get(key);
+    if (ts && Date.now() - ts > TTL_MS) recentlySent.delete(key);
+  }, TTL_MS + 5_000);
+}
 
 /**
- * @param {"hazards"|"help_requests"|"offer_help"} collection
- * @param {object} doc  - must include _id and geometry/location
+ * Notify all users within their configured radius of a new event.
+ *
+ * @param {string} collection - "hazards" | "help_requests" | "offer_help"
+ * @param {object} doc - The newly created document; must contain _id and geometry/location
  * @param {object} [opts]
- * @param {string} [opts.excludeUserId] - usually the creator
+ * @param {string} [opts.excludeUserId] - user_id to exclude (usually the creator)
  */
 export async function notifyNearbyUsers(collection, doc, opts = {}) {
+  const sendKey = `geo:${collection}:${doc?._id}`;
   try {
-    const db = getDB();
-    const users = db.collection("users");
-
-    // ---- Idempotency guard (DB-level, TTL) --------------------
-    const sendKey = `geo:${collection}:${String(doc._id)}`;
-    const ok = await shouldSendNow(sendKey, 60_000); // 60s window
-    if (!ok) {
-      console.log(`⏩ Skipping duplicate geo send for ${sendKey}`);
+    // --- Dedupe guard ---
+    if (!doc?._id) {
+      console.warn(`[PUSH][geo] ⚠️ Missing doc._id for ${collection}, abort.`);
+      return;
+    }
+    const last = recentlySent.get(sendKey);
+    if (last && Date.now() - last < TTL_MS) {
+      console.log(`[PUSH][geo] ⏩ Skipping duplicate send for ${sendKey}`);
       return;
     }
 
-    // ---- Extract event location ------------------------------
+    // --- Extract event lat/lng ---
     let eventLat = 0, eventLng = 0;
     if (doc?.geometry?.coordinates?.length >= 2) {
       [eventLng, eventLat] = doc.geometry.coordinates;
@@ -44,32 +63,56 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
     } else if (typeof doc.lat === "number" && typeof doc.lng === "number") {
       eventLat = doc.lat; eventLng = doc.lng;
     } else {
-      console.warn("⚠️ notifyNearbyUsers: Event missing geometry/location.");
+      console.warn("[PUSH][geo] ⚠️ Event missing geometry/location; abort.");
       return;
     }
 
-    // ---- Find candidate users with tokens & radius ------------
+    console.log(
+      `[PUSH][geo] ▶ ${collection}/${doc._id} at lat=${eventLat}, lng=${eventLng}`
+    );
+
+    // --- Load candidate users ---
+    const db = getDB();
+    const users = db.collection("users");
+
+    // ⚠️ Important change: don't require radiusMi in the query.
+    // Some users may not have set it yet; we'll fallback to DEFAULT_RADIUS_MI.
     const candidates = await users
       .find({
         lastLocation: { $exists: true },
-        radiusMi: { $gt: 0 },
         fcm_tokens: { $exists: true, $ne: [] },
       })
       .project({ user_id: 1, fcm_tokens: 1, lastLocation: 1, radiusMi: 1 })
       .toArray();
 
+    console.log(`[PUSH][geo] candidates found: ${candidates.length}`);
+
     if (!candidates.length) {
-      console.log("ℹ️ No users with location + tokens found.");
+      console.log("[PUSH][geo] ℹ️ No users with lastLocation + fcm_tokens.");
       return;
     }
 
-    // ---- Build token set (dedupe) & exclude creator ----------
+    // --- Build unique token set within geofence ---
     const excludeUserId = opts.excludeUserId ?? doc.user_id;
     const tokenSet = new Set();
+    let considered = 0, inside = 0, skippedNoLoc = 0, skippedCreator = 0;
 
     for (const u of candidates) {
-      if (!u.lastLocation || !u.radiusMi) continue;
-      if (excludeUserId && u.user_id === excludeUserId) continue;
+      if (!u?.lastLocation?.lat || !u?.lastLocation?.lng) {
+        skippedNoLoc++;
+        continue;
+      }
+      considered++;
+
+      if (excludeUserId && u.user_id === excludeUserId) {
+        skippedCreator++;
+        continue;
+      }
+
+      const userRadius =
+        typeof u.radiusMi === "number" && u.radiusMi > 0
+          ? u.radiusMi
+          : DEFAULT_RADIUS_MI;
 
       const dist = haversineDistanceMi(
         u.lastLocation.lat,
@@ -77,25 +120,34 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
         eventLat,
         eventLng
       );
-      if (!isNaN(dist) && dist <= u.radiusMi) {
-        for (const t of (u.fcm_tokens || [])) {
+
+      if (!isNaN(dist) && dist <= userRadius) {
+        inside++;
+        for (const t of u.fcm_tokens || []) {
           if (typeof t === "string" && t.length > 10) tokenSet.add(t);
         }
       }
     }
 
     const tokens = Array.from(tokenSet);
+    console.log(
+      `[PUSH][geo] considered=${considered}, inside=${inside}, creatorSkipped=${skippedCreator}, noLoc=${skippedNoLoc}, uniqueTokens=${tokens.length}`
+    );
+
     if (tokens.length === 0) {
-      console.log(`ℹ️ No nearby users to notify for ${collection}/${doc._id}.`);
+      console.log(
+        `[PUSH][geo] ℹ️ No nearby tokens for ${collection}/${doc._id} — skipping send.`
+      );
       return;
     }
 
-    // ---- Compose message -------------------------------------
+    // --- Compose notification ---
     const titleMap = {
       hazards: "⚠️ New Hazard Reported Nearby",
       help_requests: "🚨 Help Request Near You",
       offer_help: "💚 Offer to Help in Your Area",
     };
+
     const title = titleMap[collection] || "📍 New Update in Your Area";
     const body =
       doc.description ||
@@ -103,16 +155,12 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       doc.type ||
       "A new report has been posted near your location.";
 
-    const collapseKey = `geo_${collection}_${String(doc._id)}`;
+    const collapseKey = `geo_${collection}_${doc._id}`;
 
     const message = {
-      // Keep notification block so OS shows it when app is background/killed
       notification: { title, body },
       data: {
-        // Also include in data for foreground/local handling & deep link
-        title,
-        body,
-        deeplink: `disasterhelp://detail?c=${collection}&id=${String(doc._id)}`,
+        deeplink: `disasterhelp://detail?c=${collection}&id=${doc._id}`,
         collection,
         docId: String(doc._id),
       },
@@ -122,24 +170,26 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
         collapseKey,
         notification: {
           channelId: "alerts",
-          tag: collapseKey, // coalesce duplicates in tray
+          tag: collapseKey,
         },
       },
       apns: {
         headers: {
           "apns-priority": "10",
-          "apns-collapse-id": collapseKey, // coalesce on iOS
+          "apns-collapse-id": collapseKey,
         },
-        payload: { aps: { sound: "default" } },
+        payload: {
+          aps: { sound: "default" },
+        },
       },
     };
 
     const response = await admin.messaging().sendEachForMulticast(message);
     console.log(
-      `📤 Geo-notif ${collection}/${doc._id}: ${response.successCount}/${tokens.length} succeeded`
+      `[PUSH][geo] 📤 Sent to ${tokens.length} devices (success: ${response.successCount}, failed: ${response.failureCount})`
     );
 
-    // ---- Clean invalid tokens --------------------------------
+    // --- Clean invalid tokens ---
     const invalid = [];
     response.responses.forEach((r, i) => {
       if (!r.success) {
@@ -149,6 +199,8 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
           code === "messaging/registration-token-not-registered"
         ) {
           invalid.push(tokens[i]);
+        } else {
+          console.warn("[PUSH][geo] send error:", code);
         }
       }
     });
@@ -158,9 +210,11 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
         { fcm_tokens: { $in: invalid } },
         { $pull: { fcm_tokens: { $in: invalid } } }
       );
-      console.log(`🧹 Removed ${invalid.length} invalid tokens.`);
+      console.log(`[PUSH][geo] 🧹 Removed ${invalid.length} invalid tokens.`);
     }
+
+    _markSent(sendKey);
   } catch (err) {
-    console.error("❌ notifyNearbyUsers error:", err);
+    console.error(`[PUSH][geo] ❌ Error for ${sendKey}:`, err);
   }
 }
