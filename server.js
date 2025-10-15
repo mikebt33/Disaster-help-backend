@@ -95,6 +95,42 @@ try {
   console.warn("⚠️ Schema validation skipped or already exists:", e.message);
 }
 
+// ✅ Ensure hazards schema matches new structure
+try {
+  await db.command({
+    collMod: "hazards",
+    validator: {
+      $jsonSchema: {
+        bsonType: "object",
+        required: ["geometry", "timestamp"],
+        properties: {
+          geometry: {
+            bsonType: "object",
+            required: ["type", "coordinates"],
+            properties: {
+              type: { enum: ["Point"] },
+              coordinates: {
+                bsonType: "array",
+                items: [{ bsonType: "double" }],
+                minItems: 2,
+                maxItems: 2,
+              },
+            },
+          },
+          message: { bsonType: "string" },
+          type: { bsonType: "string" },
+          timestamp: { bsonType: "date" },
+        },
+      },
+    },
+    validationLevel: "moderate",
+  });
+  console.log("✅ Schema validation applied for hazards.");
+} catch (e) {
+  console.warn("⚠️ hazards schema validation skipped or failed:", e.message);
+}
+
+
 // Optional: remove CAP alerts older than 7 days
 await db.collection("alerts_cap").deleteMany({
   sent: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
