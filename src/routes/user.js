@@ -30,29 +30,25 @@ router.post("/register-token", async (req, res) => {
  * body: { user_id: string, lat: number, lng: number, radius_mi?: number }
  * Stores lastLocation for geofencing and distance filters.
  */
-router.put("/location", async (req, res) => {
+router.all("/location", async (req, res) => {
   try {
-    const { user_id, lat, lng, radius_mi } = req.body || {};
+    const { user_id, lat, lng } = req.body || {};
     if (!user_id || typeof lat !== "number" || typeof lng !== "number") {
-      return res.status(400).json({ error: "user_id, lat, and lng are required" });
+      return res.status(400).json({ error: "user_id, lat, lng are required" });
     }
 
     const db = getDB();
-    const update = {
-      $set: {
-        lastLocation: { lat, lng },
-        radius_mi: radius_mi ?? 10,
-        updatedAt: new Date(),
+    await db.collection("users").updateOne(
+      { user_id },
+      {
+        $set: {
+          lastLocation: { lat, lng },
+          updatedAt: new Date(),
+        },
       },
-      $setOnInsert: { createdAt: new Date() },
-    };
-
-    const result = await db.collection("users").updateOne({ user_id }, update, {
-      upsert: true,
-    });
-
-    console.log(`[User] ✅ Location updated for ${user_id} (${lat}, ${lng})`);
-    return res.json({ ok: true, matched: result.matchedCount, modified: result.modifiedCount });
+      { upsert: true }
+    );
+    return res.json({ ok: true });
   } catch (e) {
     console.error("❌ /location failed:", e);
     res.status(500).json({ error: "Internal server error" });
