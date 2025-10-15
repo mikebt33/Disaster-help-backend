@@ -11,11 +11,13 @@ import hazardRoutes from "./src/routes/hazards.js";
 import alertRoutes from "./src/routes/alertsCap.js";
 import "./src/services/notifications.js";
 import userRoutes from "./src/routes/user.js";
+import followRouter from "./src/routes/follow.js";
 
 dotenv.config();
 const app = express();
 app.use(express.json());
 app.use(cors());
+app.use("/api", followRouter);
 
 // 🕓 Run cleanup once per day at 2 AM UTC
 cron.schedule("0 2 * * *", async () => {
