@@ -1,3 +1,4 @@
+// src/routes/user.js
 import express from "express";
 import { getDB } from "../db.js";
 import admin from "../services/firebaseAdmin.js";
@@ -25,28 +26,33 @@ router.post("/register-token", async (req, res) => {
 });
 
 /**
- * POST /api/user/location
- * body: { user_id: string, lat: number, lng: number }
- * Stores lastLocation for geofencing.
+ * ✅ PUT /api/user/location
+ * body: { user_id: string, lat: number, lng: number, radius_mi?: number }
+ * Stores lastLocation for geofencing and distance filters.
  */
-router.post("/location", async (req, res) => {
+router.put("/location", async (req, res) => {
   try {
-    const { user_id, lat, lng } = req.body || {};
+    const { user_id, lat, lng, radius_mi } = req.body || {};
     if (!user_id || typeof lat !== "number" || typeof lng !== "number") {
-      return res.status(400).json({ error: "user_id, lat, lng are required" });
+      return res.status(400).json({ error: "user_id, lat, and lng are required" });
     }
+
     const db = getDB();
-    await db.collection("users").updateOne(
-      { user_id },
-      {
-        $set: {
-          lastLocation: { lat, lng },
-          updatedAt: new Date(),
-        },
+    const update = {
+      $set: {
+        lastLocation: { lat, lng },
+        radius_mi: radius_mi ?? 10,
+        updatedAt: new Date(),
       },
-      { upsert: true }
-    );
-    return res.json({ ok: true });
+      $setOnInsert: { createdAt: new Date() },
+    };
+
+    const result = await db.collection("users").updateOne({ user_id }, update, {
+      upsert: true,
+    });
+
+    console.log(`[User] ✅ Location updated for ${user_id} (${lat}, ${lng})`);
+    return res.json({ ok: true, matched: result.matchedCount, modified: result.modifiedCount });
   } catch (e) {
     console.error("❌ /location failed:", e);
     res.status(500).json({ error: "Internal server error" });
@@ -87,7 +93,7 @@ router.patch("/settings", async (req, res) => {
 
 /**
  * GET /api/user/me?user_id=abc
- * Returns minimal profile for debugging geofence.
+ * Returns minimal profile for debugging geofence + push.
  */
 router.get("/me", async (req, res) => {
   try {
@@ -116,15 +122,18 @@ router.post("/test-push", async (req, res) => {
     const { token, user_id, title, body } = req.body || {};
     let tokens = [];
 
+    const db = getDB();
+
     if (token) {
       tokens = [token];
     } else if (user_id) {
-      const db = getDB();
       const u = await db.collection("users").findOne(
         { user_id },
         { projection: { fcm_tokens: 1 } }
       );
-      tokens = (u?.fcm_tokens || []).filter(t => typeof t === "string" && t.length > 10);
+      tokens = (u?.fcm_tokens || []).filter(
+        (t) => typeof t === "string" && t.length > 10
+      );
     } else {
       return res.status(400).json({ error: "Provide token or user_id" });
     }
@@ -140,16 +149,26 @@ router.post("/test-push", async (req, res) => {
       },
       data: { deeplink: "disasterhelp://home" },
       tokens,
-      android: { priority: "high", notification: { channelId: "alerts" } },
-      apns: { headers: { "apns-priority": "10" }, payload: { aps: { sound: "default" } } },
+      android: {
+        priority: "high",
+        notification: { channelId: "alerts" },
+      },
+      apns: {
+        headers: { "apns-priority": "10" },
+        payload: { aps: { sound: "default" } },
+      },
     };
 
     const resp = await admin.messaging().sendEachForMulticast(message);
+
+    console.log(`[PushTest] Sent to ${tokens.length}, success=${resp.successCount}`);
     res.json({
       successCount: resp.successCount,
       failureCount: resp.failureCount,
       errors: resp.responses
-        .map((r, i) => (!r.success ? { token: tokens[i], code: r.error?.code } : null))
+        .map((r, i) =>
+          !r.success ? { token: tokens[i], code: r.error?.code } : null
+        )
         .filter(Boolean),
     });
   } catch (e) {
