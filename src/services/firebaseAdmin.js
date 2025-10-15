@@ -1,5 +1,7 @@
 // src/services/firebaseAdmin.js
 import admin from "firebase-admin";
+import { readFileSync, existsSync } from "fs";
+import path from "path";
 
 if (!admin.apps.length) {
   try {
@@ -11,13 +13,22 @@ if (!admin.apps.length) {
       });
       console.log("✅ Firebase Admin initialized with inline credentials");
     } else {
-      admin.initializeApp({
-        credential: admin.credential.applicationDefault(),
-      });
-      console.log("⚠️ Firebase Admin initialized using ADC (fallback)");
+      const keyPath = path.resolve("./keys/fcm-service-account.json");
+      if (existsSync(keyPath)) {
+        const creds = JSON.parse(readFileSync(keyPath, "utf8"));
+        admin.initializeApp({
+          credential: admin.credential.cert(creds),
+        });
+        console.log("✅ Firebase Admin initialized with local service account file");
+      } else {
+        admin.initializeApp({
+          credential: admin.credential.applicationDefault(),
+        });
+        console.log("⚠️ Firebase Admin initialized using ADC fallback");
+      }
     }
   } catch (err) {
-    console.error("❌ Firebase Admin init failed:", err);
+    console.error("❌ Firebase Admin initialization failed:", err);
   }
 }
 
