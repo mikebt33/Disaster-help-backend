@@ -17,7 +17,13 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 app.use(cors());
+app.use("/api/help-requests", helpRequestsRouter);
+app.use("/api/offers", offersRouter);
+app.use("/api/hazards", hazardsRouter);
+app.use("/api/user", userRouter);
 app.use("/api", followRouter);
+app.use("/api/alerts-cap", alertRoutes);
+
 
 // 🕓 Run cleanup once per day at 2 AM UTC
 cron.schedule("0 2 * * *", async () => {
