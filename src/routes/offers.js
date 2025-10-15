@@ -3,6 +3,7 @@ import { getDB } from "../db.js";
 import { ObjectId } from "mongodb";
 import { notifyFollowersOfUpdate } from "../services/notifications.js";
 import { notifyNearbyUsers } from "../services/notifyNearbyUsers.js";
+import { sendPush } from "../services/fcmService.js";
 
 const router = express.Router();
 
