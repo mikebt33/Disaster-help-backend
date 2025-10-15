@@ -41,10 +41,12 @@ router.post("/", async (req, res) => {
     });
 
     res.status(201).json({ id: result.insertedId.toString(), ...doc });
-  } catch {
-    res.status(500).json({ error: "Internal server error." });
-  }
-});
+    } catch (err) {
+      console.error("❌ /api/hazards failed:", err);
+      res.status(500).json({ error: err.message || "Internal server error." });
+    }
+  });
+
 
 /** GET /near /:id **/
 router.get("/", async (_req, res) => {
