@@ -171,8 +171,9 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
     const collapseKey = `geo_${collection}_${doc._id}`;
 
     const message = {
-      notification: { title, body },
       data: {
+        title,
+        body,
         deeplink: `disasterhelp://detail?c=${collection}&id=${doc._id}`,
         collection,
         docId: String(doc._id),
