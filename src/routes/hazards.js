@@ -19,7 +19,6 @@ router.post("/", async (req, res) => {
     const db = getDB();
     const coll = db.collection("hazards");
 
-    // ✅ Normalize types array
     const allTypes = Array.isArray(types)
       ? types
       : type
@@ -45,29 +44,33 @@ router.post("/", async (req, res) => {
     const result = await coll.insertOne(doc);
     const inserted = { ...doc, _id: result.insertedId };
 
-    // ✅ Trigger notifications excluding poster’s tokens
-        setImmediate(async () => {
-          try {
-            const poster = doc.user_id
-              ? await db.collection("users").findOne({ user_id: doc.user_id })
-              : null;
-            const excludeTokens = Array.isArray(poster?.fcm_tokens) ? poster.fcm_tokens : [];
+    // ✅ Fire notifications asynchronously, excluding poster’s tokens
+    setImmediate(async () => {
+      try {
+        const poster = doc.user_id
+          ? await db.collection("users").findOne({ user_id: doc.user_id })
+          : null;
+        const excludeTokens = Array.isArray(poster?.fcm_tokens)
+          ? poster.fcm_tokens
+          : [];
 
-            await notifyNearbyUsers("hazards", inserted, {
-              excludeUserId: doc.user_id,
-              excludeTokens,
-            });
-          } catch (err) {
-            console.error("notifyNearbyUsers (hazards) error:", err);
-          }
+        const insertedWithTokens = { ...inserted, fcm_tokens: excludeTokens };
+
+        await notifyNearbyUsers("hazards", insertedWithTokens, {
+          excludeUserId: doc.user_id,
+          excludeTokens,
         });
-
-        res.status(201).json({ id: result.insertedId.toString(), ...doc });
       } catch (err) {
-        console.error("POST /api/hazards error:", err);
-        res.status(500).json({ error: "Internal server error." });
+        console.error("notifyNearbyUsers (hazards) error:", err);
       }
     });
+
+    res.status(201).json({ id: result.insertedId.toString(), ...doc });
+  } catch (err) {
+    console.error("POST /api/hazards error:", err);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
 
 /** GET all / near / by id **/
 router.get("/", async (_req, res) => {
@@ -146,8 +149,7 @@ router.patch("/:id/confirm", async (req, res) => {
 
     const votes = doc.votes || {};
     const cur = votes[user_id];
-    if (cur === "confirm")
-      return res.json({ message: "Already confirmed." });
+    if (cur === "confirm") return res.json({ message: "Already confirmed." });
 
     const update = { $set: { [`votes.${user_id}`]: "confirm" }, $inc: {} };
     if (cur === "dispute") {
@@ -157,13 +159,7 @@ router.patch("/:id/confirm", async (req, res) => {
 
     await coll.updateOne(query, update);
     setImmediate(() =>
-      notifyFollowersOfUpdate(
-        "hazards",
-        id,
-        user_id,
-        "confirm",
-        "A hazard was confirmed."
-      )
+      notifyFollowersOfUpdate("hazards", id, user_id, "confirm", "A hazard was confirmed.")
     );
     res.json({ message: "Confirm recorded." });
   } catch {
@@ -188,8 +184,7 @@ router.patch("/:id/dispute", async (req, res) => {
 
     const votes = doc.votes || {};
     const cur = votes[user_id];
-    if (cur === "dispute")
-      return res.json({ message: "Already disputed." });
+    if (cur === "dispute") return res.json({ message: "Already disputed." });
 
     const update = { $set: { [`votes.${user_id}`]: "dispute" }, $inc: {} };
     if (cur === "confirm") {
@@ -199,13 +194,7 @@ router.patch("/:id/dispute", async (req, res) => {
 
     await coll.updateOne(query, update);
     setImmediate(() =>
-      notifyFollowersOfUpdate(
-        "hazards",
-        id,
-        user_id,
-        "dispute",
-        "A hazard was disputed."
-      )
+      notifyFollowersOfUpdate("hazards", id, user_id, "dispute", "A hazard was disputed.")
     );
     res.json({ message: "Dispute recorded." });
   } catch {
@@ -221,19 +210,11 @@ router.patch("/:id/resolve", async (req, res) => {
       ? { _id: new ObjectId(id) }
       : { _id: id };
     const coll = db.collection("hazards");
-    const r = await coll.updateOne(query, {
-      $set: { resolved: true, resolvedAt: new Date() },
-    });
+    const r = await coll.updateOne(query, { $set: { resolved: true, resolvedAt: new Date() } });
     if (!r.matchedCount)
       return res.status(404).json({ error: "Not found." });
     setImmediate(() =>
-      notifyFollowersOfUpdate(
-        "hazards",
-        id,
-        null,
-        "resolve",
-        "A followed hazard was resolved."
-      )
+      notifyFollowersOfUpdate("hazards", id, null, "resolve", "A followed hazard was resolved.")
     );
     res.json({ message: "Hazard resolved." });
   } catch {
@@ -267,13 +248,7 @@ router.patch("/:id/follow", async (req, res) => {
 
     if (!alreadyFollowing)
       setImmediate(() =>
-        notifyFollowersOfUpdate(
-          "hazards",
-          id,
-          user_id,
-          "follow",
-          "A post you follow has a new follower."
-        )
+        notifyFollowersOfUpdate("hazards", id, user_id, "follow", "A post you follow has a new follower.")
       );
 
     res.json({

@@ -46,21 +46,32 @@ router.post("/", async (req, res) => {
     const inserted = { ...doc, _id: result.insertedId };
 
     // ✅ Fire notifications asynchronously, excluding poster’s tokens
-       setImmediate(async () => {
-         try {
-           const poster = doc.user_id
-             ? await db.collection("users").findOne({ user_id: doc.user_id })
-             : null;
-           const excludeTokens = Array.isArray(poster?.fcm_tokens) ? poster.fcm_tokens : [];
+    setImmediate(async () => {
+      try {
+        const poster = doc.user_id
+          ? await db.collection("users").findOne({ user_id: doc.user_id })
+          : null;
+        const excludeTokens = Array.isArray(poster?.fcm_tokens)
+          ? poster.fcm_tokens
+          : [];
 
-           await notifyNearbyUsers("offer_help", inserted, {
-             excludeUserId: doc.user_id,
-             excludeTokens,
-           });
-         } catch (err) {
-           console.error("notifyNearbyUsers (offer_help) error:", err);
-         }
-       });
+        const insertedWithTokens = { ...inserted, fcm_tokens: excludeTokens };
+
+        await notifyNearbyUsers("offer_help", insertedWithTokens, {
+          excludeUserId: doc.user_id,
+          excludeTokens,
+        });
+      } catch (err) {
+        console.error("notifyNearbyUsers (offer_help) error:", err);
+      }
+    });
+
+    res.status(201).json({ id: result.insertedId.toString(), ...doc });
+  } catch (err) {
+    console.error("POST /api/offers error:", err);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
 
 /** GET all / near / by id **/
 router.get("/", async (_req, res) => {
@@ -281,7 +292,8 @@ router.patch("/:id/follow", async (req, res) => {
 router.post("/:id/comments", async (req, res) => {
   try {
     const { user_id, text } = req.body;
-    if (!text) return res.status(400).json({ error: "Comment text required." });
+    if (!text)
+      return res.status(400).json({ error: "Comment text required." });
 
     const db = getDB();
     const { id } = req.params;

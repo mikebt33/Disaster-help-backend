@@ -12,7 +12,6 @@ const router = express.Router();
  */
 router.post("/", async (req, res) => {
   try {
-    // ✅ Backward & forward compatibility
     const {
       user_id,
       type,
@@ -24,34 +23,27 @@ router.post("/", async (req, res) => {
       emergency,
     } = req.body;
 
-    if (!lat || !lng) {
-      return res
-        .status(400)
-        .json({ error: "Latitude and longitude required." });
-    }
+    if (!lat || !lng)
+      return res.status(400).json({ error: "Latitude and longitude required." });
 
-    // --- normalize new/old field shapes ---
+    const db = getDB();
+    const coll = db.collection("help_requests");
+
+    // Normalize type fields
     const types = Array.isArray(incomingTypes)
       ? incomingTypes.filter(Boolean)
       : type
       ? [type]
       : ["general"];
-
     const details = incomingDetails || message || "";
-
-    const db = getDB();
-    const coll = db.collection("help_requests");
 
     const doc = {
       user_id: user_id || null,
-      type: types[0] || "general", // legacy support
-      types,                       // ✅ new multi-type field
-      message: details,            // unify to one text
-      details,                     // ✅ new alias for frontend/UI
-      location: {
-        type: "Point",
-        coordinates: [parseFloat(lng), parseFloat(lat)],
-      },
+      type: types[0] || "general",
+      types,
+      message: details,
+      details,
+      location: { type: "Point", coordinates: [parseFloat(lng), parseFloat(lat)] },
       emergency: emergency === true || emergency === "true",
       status: "open",
       confirmCount: 0,
@@ -65,31 +57,35 @@ router.post("/", async (req, res) => {
     const result = await coll.insertOne(doc);
     const inserted = { ...doc, _id: result.insertedId };
 
-    // ✅ Notify nearby users (excluding poster’s device tokens)
-       setImmediate(async () => {
-         try {
-           const poster = doc.user_id
-             ? await db.collection("users").findOne({ user_id: doc.user_id })
-             : null;
-           const excludeTokens = Array.isArray(poster?.fcm_tokens) ? poster.fcm_tokens : [];
+    // ✅ Fire notifications asynchronously, excluding poster’s tokens
+    setImmediate(async () => {
+      try {
+        const poster = doc.user_id
+          ? await db.collection("users").findOne({ user_id: doc.user_id })
+          : null;
+        const excludeTokens = Array.isArray(poster?.fcm_tokens)
+          ? poster.fcm_tokens
+          : [];
 
-           await notifyNearbyUsers("help_requests", inserted, {
-             excludeUserId: doc.user_id,
-             excludeTokens,
-           });
-         } catch (err) {
-           console.error("notifyNearbyUsers (help_requests) error:", err);
-         }
-       });
+        const insertedWithTokens = { ...inserted, fcm_tokens: excludeTokens };
 
-       res.status(201).json({ id: result.insertedId.toString(), ...doc });
-     } catch (err) {
-       console.error("POST /api/help-requests error:", err);
-       res.status(500).json({ error: "Internal server error." });
-     }
-   });
+        await notifyNearbyUsers("help_requests", insertedWithTokens, {
+          excludeUserId: doc.user_id,
+          excludeTokens,
+        });
+      } catch (err) {
+        console.error("notifyNearbyUsers (help_requests) error:", err);
+      }
+    });
 
-/** GET all / near / by id — unchanged **/
+    res.status(201).json({ id: result.insertedId.toString(), ...doc });
+  } catch (err) {
+    console.error("POST /api/help-requests error:", err);
+    res.status(500).json({ error: "Internal server error." });
+  }
+});
+
+/** GET all / near / by id **/
 router.get("/", async (_req, res) => {
   try {
     const db = getDB();
@@ -148,7 +144,7 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-/** confirm / dispute / resolve — unchanged core logic **/
+/** confirm / dispute / resolve **/
 router.patch("/:id/confirm", async (req, res) => {
   try {
     const { user_id } = req.body;
@@ -259,10 +255,7 @@ router.patch("/:id/resolve", async (req, res) => {
   }
 });
 
-/**
- * PATCH /api/help-requests/:id/follow
- * Adds follow-notification support
- */
+/** follow / comments / delete **/
 router.patch("/:id/follow", async (req, res) => {
   try {
     const { user_id } = req.body;
@@ -286,7 +279,7 @@ router.patch("/:id/follow", async (req, res) => {
 
     await coll.updateOne(query, update);
 
-    if (!alreadyFollowing) {
+    if (!alreadyFollowing)
       setImmediate(() =>
         notifyFollowersOfUpdate(
           "help_requests",
@@ -296,7 +289,6 @@ router.patch("/:id/follow", async (req, res) => {
           "A post you follow has a new follower."
         )
       );
-    }
 
     res.json({
       message: alreadyFollowing ? "Unfollowed" : "Followed",
@@ -307,11 +299,11 @@ router.patch("/:id/follow", async (req, res) => {
   }
 });
 
-/** comments + delete unchanged **/
 router.post("/:id/comments", async (req, res) => {
   try {
     const { user_id, text } = req.body;
-    if (!text) return res.status(400).json({ error: "Comment text required." });
+    if (!text)
+      return res.status(400).json({ error: "Comment text required." });
 
     const db = getDB();
     const { id } = req.params;
