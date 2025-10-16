@@ -92,39 +92,42 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       return;
     }
 
-   // --- Build unique token set within geofence ---
-   const excludeUserId = opts.excludeUserId ?? doc.user_id;
-   const excludeTokens = new Set(
-     (opts.excludeTokens ?? []).filter(t => typeof t === "string" && t.length > 10)
-   );
+  // --- Build unique token set within geofence ---
+  const excludeUserId = opts.excludeUserId ?? doc.user_id;
+  const excludeTokens = new Set(
+    (opts.excludeTokens ?? []).filter(t => typeof t === "string" && t.length > 10)
+  );
 
-   const tokenSet = new Set();
-   let considered = 0, inside = 0, skippedNoLoc = 0, skippedCreator = 0, skippedDevice = 0;
+  const tokenSet = new Set();
+  let considered = 0, skippedNoLoc = 0, skippedCreator = 0, skippedDevice = 0;
 
-   for (const u of candidates) {
-     if (!u?.lastLocation?.lat || !u?.lastLocation?.lng) {
-       skippedNoLoc++;
-       continue;
-     }
-     considered++;
+  for (const u of candidates) {
+    if (!u?.lastLocation?.lat || !u?.lastLocation?.lng) {
+      skippedNoLoc++;
+      continue;
+    }
+    considered++;
 
-     // ✅ Skip the creator (normalize to string)
-     if (
-       excludeUserId &&
-       u.user_id &&
-       u.user_id.toString().trim() === excludeUserId.toString().trim()
-     ) {
-       skippedCreator++;
-       continue;
-     }
+    // ✅ Skip the creator
+    if (
+      excludeUserId &&
+      u.user_id &&
+      u.user_id.toString().trim() === excludeUserId.toString().trim()
+    ) {
+      skippedCreator++;
+      continue;
+    }
 
-     // ✅ Skip same physical device (token dedupe)
-     if (Array.isArray(u.fcm_tokens)) {
-       const hasExcluded = u.fcm_tokens.some(t => excludeTokens.has(t));
-       if (hasExcluded) {
-         skippedDevice++;
-         continue;
-       }
+    // ✅ Skip same device only if both have FCM tokens
+    if (
+      Array.isArray(doc.fcm_tokens) &&
+      doc.fcm_tokens.length > 0 &&
+      Array.isArray(u.fcm_tokens) &&
+      u.fcm_tokens.some(t => doc.fcm_tokens.includes(t))
+    ) {
+      skippedDevice++;
+      continue;
+    }
 
        for (const t of u.fcm_tokens) {
          if (typeof t === "string" && t.length > 10 && !excludeTokens.has(t)) {
