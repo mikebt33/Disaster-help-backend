@@ -65,23 +65,29 @@ router.post("/", async (req, res) => {
     const result = await coll.insertOne(doc);
     const inserted = { ...doc, _id: result.insertedId };
 
-    // async notify nearby users (non-blocking)
-    setImmediate(async () => {
-      try {
-        await notifyNearbyUsers("help_requests", inserted, {
-          excludeUserId: user_id,
-        });
-      } catch (err) {
-        console.error("notifyNearbyUsers error:", err);
-      }
-    });
+    // ✅ Notify nearby users (excluding poster’s device tokens)
+       setImmediate(async () => {
+         try {
+           const poster = doc.user_id
+             ? await db.collection("users").findOne({ user_id: doc.user_id })
+             : null;
+           const excludeTokens = Array.isArray(poster?.fcm_tokens) ? poster.fcm_tokens : [];
 
-    res.status(201).json({ id: result.insertedId.toString(), ...doc });
-  } catch (err) {
-    console.error("POST /help-requests error:", err);
-    res.status(500).json({ error: "Internal server error." });
-  }
-});
+           await notifyNearbyUsers("help_requests", inserted, {
+             excludeUserId: doc.user_id,
+             excludeTokens,
+           });
+         } catch (err) {
+           console.error("notifyNearbyUsers (help_requests) error:", err);
+         }
+       });
+
+       res.status(201).json({ id: result.insertedId.toString(), ...doc });
+     } catch (err) {
+       console.error("POST /api/help-requests error:", err);
+       res.status(500).json({ error: "Internal server error." });
+     }
+   });
 
 /** GET all / near / by id — unchanged **/
 router.get("/", async (_req, res) => {

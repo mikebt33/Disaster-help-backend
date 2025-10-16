@@ -45,25 +45,29 @@ router.post("/", async (req, res) => {
     const result = await coll.insertOne(doc);
     const inserted = { ...doc, _id: result.insertedId };
 
-    // ✅ Notify nearby users asynchronously
-    setImmediate(async () => {
-      try {
-        await notifyNearbyUsers("hazards", inserted, {
-          excludeUserId: user_id,
+    // ✅ Trigger notifications excluding poster’s tokens
+        setImmediate(async () => {
+          try {
+            const poster = doc.user_id
+              ? await db.collection("users").findOne({ user_id: doc.user_id })
+              : null;
+            const excludeTokens = Array.isArray(poster?.fcm_tokens) ? poster.fcm_tokens : [];
+
+            await notifyNearbyUsers("hazards", inserted, {
+              excludeUserId: doc.user_id,
+              excludeTokens,
+            });
+          } catch (err) {
+            console.error("notifyNearbyUsers (hazards) error:", err);
+          }
         });
+
+        res.status(201).json({ id: result.insertedId.toString(), ...doc });
       } catch (err) {
-        console.error("notifyNearbyUsers failed:", err);
+        console.error("POST /api/hazards error:", err);
+        res.status(500).json({ error: "Internal server error." });
       }
     });
-
-    res.status(201).json({ id: result.insertedId.toString(), ...doc });
-  } catch (err) {
-    console.error("❌ /api/hazards failed:", err);
-    res
-      .status(500)
-      .json({ error: err.message || "Internal server error." });
-  }
-});
 
 /** GET all / near / by id **/
 router.get("/", async (_req, res) => {

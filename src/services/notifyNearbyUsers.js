@@ -92,49 +92,51 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       return;
     }
 
-    // --- Build unique token set within geofence ---
-    const excludeUserId = opts.excludeUserId ?? doc.user_id;
-    const tokenSet = new Set();
-    let considered = 0, inside = 0, skippedNoLoc = 0, skippedCreator = 0;
+   // --- Build unique token set within geofence ---
+   const excludeUserId = opts.excludeUserId ?? doc.user_id;
+   const excludeTokens = new Set(
+     (opts.excludeTokens ?? []).filter(t => typeof t === "string" && t.length > 10)
+   );
 
-    for (const u of candidates) {
-      if (!u?.lastLocation?.lat || !u?.lastLocation?.lng) {
-        skippedNoLoc++;
-        continue;
-      }
-      considered++;
+   const tokenSet = new Set();
+   let considered = 0, inside = 0, skippedNoLoc = 0, skippedCreator = 0, skippedDevice = 0;
 
-      // ✅ Skip the creator (normalized ID check)
-      if (
-        excludeUserId &&
-        u.user_id &&
-        u.user_id.toString().trim() === excludeUserId.toString().trim()
-      ) {
-        skippedCreator++;
-        continue;
-      }
+   for (const u of candidates) {
+     if (!u?.lastLocation?.lat || !u?.lastLocation?.lng) {
+       skippedNoLoc++;
+       continue;
+     }
+     considered++;
 
-      // ✅ Skip same physical device (duplicate tokens)
-      if (
-        Array.isArray(u.fcm_tokens) &&
-        Array.isArray(doc.fcm_tokens) &&
-        u.fcm_tokens.some(t => doc.fcm_tokens.includes(t))
-      ) {
-        continue;
-      }
+     // ✅ Skip the creator (normalize to string)
+     if (
+       excludeUserId &&
+       u.user_id &&
+       u.user_id.toString().trim() === excludeUserId.toString().trim()
+     ) {
+       skippedCreator++;
+       continue;
+     }
 
-      // ✅ Add valid tokens for this user
-      for (const t of u.fcm_tokens || []) {
-        if (typeof t === "string" && t.length > 10) {
-          tokenSet.add(t);
-        }
-      }
-    }
+     // ✅ Skip same physical device (token dedupe)
+     if (Array.isArray(u.fcm_tokens)) {
+       const hasExcluded = u.fcm_tokens.some(t => excludeTokens.has(t));
+       if (hasExcluded) {
+         skippedDevice++;
+         continue;
+       }
 
-    const tokens = Array.from(tokenSet);
-    console.log(
-      `[PUSH][geo] considered=${considered}, inside=${inside}, creatorSkipped=${skippedCreator}, noLoc=${skippedNoLoc}, uniqueTokens=${tokens.length}`
-    );
+       for (const t of u.fcm_tokens) {
+         if (typeof t === "string" && t.length > 10 && !excludeTokens.has(t)) {
+           tokenSet.add(t);
+         }
+       }
+     }
+   }
+
+   console.log(
+     `[PUSH][geo] considered=${considered}, inside=${inside}, skippedCreator=${skippedCreator}, skippedDevice=${skippedDevice}, noLoc=${skippedNoLoc}, uniqueTokens=${tokenSet.size}`
+   );
 
     if (tokens.length === 0) {
       console.log(

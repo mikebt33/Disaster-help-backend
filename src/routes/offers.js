@@ -45,23 +45,22 @@ router.post("/", async (req, res) => {
     const result = await coll.insertOne(doc);
     const inserted = { ...doc, _id: result.insertedId };
 
-    // ✅ Notify nearby users asynchronously
-    setImmediate(async () => {
-      try {
-        await notifyNearbyUsers("offer_help", inserted, {
-          excludeUserId: user_id,
-        });
-      } catch (err) {
-        console.error("notifyNearbyUsers failed:", err);
-      }
-    });
+    // ✅ Fire notifications asynchronously, excluding poster’s tokens
+       setImmediate(async () => {
+         try {
+           const poster = doc.user_id
+             ? await db.collection("users").findOne({ user_id: doc.user_id })
+             : null;
+           const excludeTokens = Array.isArray(poster?.fcm_tokens) ? poster.fcm_tokens : [];
 
-    res.status(201).json({ id: result.insertedId.toString(), ...doc });
-  } catch (err) {
-    console.error("POST /api/offers error:", err);
-    res.status(500).json({ error: "Internal server error." });
-  }
-});
+           await notifyNearbyUsers("offer_help", inserted, {
+             excludeUserId: doc.user_id,
+             excludeTokens,
+           });
+         } catch (err) {
+           console.error("notifyNearbyUsers (offer_help) error:", err);
+         }
+       });
 
 /** GET all / near / by id **/
 router.get("/", async (_req, res) => {
