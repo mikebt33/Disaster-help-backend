@@ -12,17 +12,46 @@ const router = express.Router();
  */
 router.post("/", async (req, res) => {
   try {
-    const { user_id, type, message, lat, lng, emergency } = req.body;
-    if (!lat || !lng)
-      return res.status(400).json({ error: "Latitude and longitude required." });
+    // ✅ Backward & forward compatibility
+    const {
+      user_id,
+      type,
+      message,
+      details: incomingDetails,
+      types: incomingTypes,
+      lat,
+      lng,
+      emergency,
+    } = req.body;
+
+    if (!lat || !lng) {
+      return res
+        .status(400)
+        .json({ error: "Latitude and longitude required." });
+    }
+
+    // --- normalize new/old field shapes ---
+    const types = Array.isArray(incomingTypes)
+      ? incomingTypes.filter(Boolean)
+      : type
+      ? [type]
+      : ["general"];
+
+    const details = incomingDetails || message || "";
 
     const db = getDB();
     const coll = db.collection("help_requests");
+
     const doc = {
       user_id: user_id || null,
-      type: type || "general",
-      message: message || "",
-      location: { type: "Point", coordinates: [parseFloat(lng), parseFloat(lat)] },
+      type: types[0] || "general", // legacy support
+      types,                       // ✅ new multi-type field
+      message: details,            // unify to one text
+      details,                     // ✅ new alias for frontend/UI
+      location: {
+        type: "Point",
+        coordinates: [parseFloat(lng), parseFloat(lat)],
+      },
       emergency: emergency === true || emergency === "true",
       status: "open",
       confirmCount: 0,
@@ -36,23 +65,34 @@ router.post("/", async (req, res) => {
     const result = await coll.insertOne(doc);
     const inserted = { ...doc, _id: result.insertedId };
 
+    // async notify nearby users (non-blocking)
     setImmediate(async () => {
       try {
-        await notifyNearbyUsers("help_requests", inserted, { excludeUserId: user_id });
-      } catch {}
+        await notifyNearbyUsers("help_requests", inserted, {
+          excludeUserId: user_id,
+        });
+      } catch (err) {
+        console.error("notifyNearbyUsers error:", err);
+      }
     });
 
     res.status(201).json({ id: result.insertedId.toString(), ...doc });
-  } catch {
+  } catch (err) {
+    console.error("POST /help-requests error:", err);
     res.status(500).json({ error: "Internal server error." });
   }
 });
 
-/** GET all / near / by id  — unchanged **/
+/** GET all / near / by id — unchanged **/
 router.get("/", async (_req, res) => {
   try {
     const db = getDB();
-    const docs = await db.collection("help_requests").find({}).sort({ timestamp: -1 }).limit(100).toArray();
+    const docs = await db
+      .collection("help_requests")
+      .find({})
+      .sort({ timestamp: -1 })
+      .limit(100)
+      .toArray();
     res.json(docs.map((d) => ({ ...d, _id: d._id.toString() })));
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -64,17 +104,22 @@ router.get("/near", async (req, res) => {
     const lat = parseFloat(req.query.lat);
     const lng = parseFloat(req.query.lng);
     const radiusKm = parseFloat(req.query.radius_km || 5);
-    if (isNaN(lat) || isNaN(lng)) return res.status(400).json({ error: "Valid lat/lng required." });
+    if (isNaN(lat) || isNaN(lng))
+      return res.status(400).json({ error: "Valid lat/lng required." });
 
     const db = getDB();
-    const results = await db.collection("help_requests").find({
-      location: {
-        $nearSphere: {
-          $geometry: { type: "Point", coordinates: [lng, lat] },
-          $maxDistance: radiusKm * 1000,
+    const results = await db
+      .collection("help_requests")
+      .find({
+        location: {
+          $nearSphere: {
+            $geometry: { type: "Point", coordinates: [lng, lat] },
+            $maxDistance: radiusKm * 1000,
+          },
         },
-      },
-    }).limit(100).toArray();
+      })
+      .limit(100)
+      .toArray();
 
     res.json(results.map((r) => ({ ...r, _id: r._id.toString() })));
   } catch {
@@ -86,7 +131,9 @@ router.get("/:id", async (req, res) => {
   try {
     const db = getDB();
     const id = req.params.id;
-    const query = /^[0-9a-fA-F]{24}$/.test(id) ? { _id: new ObjectId(id) } : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
     const doc = await db.collection("help_requests").findOne(query);
     if (!doc) return res.status(404).json({ error: "Help request not found." });
     res.json({ ...doc, _id: doc._id.toString() });
@@ -95,15 +142,18 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-/** confirm / dispute / resolve  — unchanged core logic **/
+/** confirm / dispute / resolve — unchanged core logic **/
 router.patch("/:id/confirm", async (req, res) => {
   try {
     const { user_id } = req.body;
-    if (!user_id) return res.status(400).json({ error: "user_id required." });
+    if (!user_id)
+      return res.status(400).json({ error: "user_id required." });
 
     const db = getDB();
     const id = req.params.id;
-    const query = /^[0-9a-fA-F]{24}$/.test(id) ? { _id: new ObjectId(id) } : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
     const coll = db.collection("help_requests");
     const doc = await coll.findOne(query);
     if (!doc) return res.status(404).json({ error: "Not found." });
@@ -119,7 +169,15 @@ router.patch("/:id/confirm", async (req, res) => {
     } else update.$inc.confirmCount = 1;
 
     await coll.updateOne(query, update);
-    setImmediate(() => notifyFollowersOfUpdate("help_requests", id, user_id, "confirm", "A help request was confirmed."));
+    setImmediate(() =>
+      notifyFollowersOfUpdate(
+        "help_requests",
+        id,
+        user_id,
+        "confirm",
+        "A help request was confirmed."
+      )
+    );
     res.json({ message: "Confirm recorded." });
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -129,11 +187,14 @@ router.patch("/:id/confirm", async (req, res) => {
 router.patch("/:id/dispute", async (req, res) => {
   try {
     const { user_id } = req.body;
-    if (!user_id) return res.status(400).json({ error: "user_id required." });
+    if (!user_id)
+      return res.status(400).json({ error: "user_id required." });
 
     const db = getDB();
     const id = req.params.id;
-    const query = /^[0-9a-fA-F]{24}$/.test(id) ? { _id: new ObjectId(id) } : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
     const coll = db.collection("help_requests");
     const doc = await coll.findOne(query);
     if (!doc) return res.status(404).json({ error: "Not found." });
@@ -149,7 +210,15 @@ router.patch("/:id/dispute", async (req, res) => {
     } else update.$inc.disputeCount = 1;
 
     await coll.updateOne(query, update);
-    setImmediate(() => notifyFollowersOfUpdate("help_requests", id, user_id, "dispute", "A help request was disputed."));
+    setImmediate(() =>
+      notifyFollowersOfUpdate(
+        "help_requests",
+        id,
+        user_id,
+        "dispute",
+        "A help request was disputed."
+      )
+    );
     res.json({ message: "Dispute recorded." });
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -160,11 +229,24 @@ router.patch("/:id/resolve", async (req, res) => {
   try {
     const db = getDB();
     const id = req.params.id;
-    const query = /^[0-9a-fA-F]{24}$/.test(id) ? { _id: new ObjectId(id) } : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
     const coll = db.collection("help_requests");
-    const r = await coll.updateOne(query, { $set: { resolved: true, resolvedAt: new Date() } });
-    if (!r.matchedCount) return res.status(404).json({ error: "Not found." });
-    setImmediate(() => notifyFollowersOfUpdate("help_requests", id, null, "resolve", "A followed help request has been resolved."));
+    const r = await coll.updateOne(query, {
+      $set: { resolved: true, resolvedAt: new Date() },
+    });
+    if (!r.matchedCount)
+      return res.status(404).json({ error: "Not found." });
+    setImmediate(() =>
+      notifyFollowersOfUpdate(
+        "help_requests",
+        id,
+        null,
+        "resolve",
+        "A followed help request has been resolved."
+      )
+    );
     res.json({ message: "Resolved." });
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -173,31 +255,47 @@ router.patch("/:id/resolve", async (req, res) => {
 
 /**
  * PATCH /api/help-requests/:id/follow
- * ✅ Adds follow-notification support
+ * Adds follow-notification support
  */
 router.patch("/:id/follow", async (req, res) => {
   try {
     const { user_id } = req.body;
-    if (!user_id) return res.status(400).json({ error: "user_id required." });
+    if (!user_id)
+      return res.status(400).json({ error: "user_id required." });
 
     const db = getDB();
     const id = req.params.id;
-    const query = /^[0-9a-fA-F]{24}$/.test(id) ? { _id: new ObjectId(id) } : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
     const coll = db.collection("help_requests");
     const doc = await coll.findOne(query);
     if (!doc) return res.status(404).json({ error: "Not found." });
 
     const followers = doc.followers || [];
     const alreadyFollowing = followers.includes(user_id);
-    const update = alreadyFollowing ? { $pull: { followers: user_id } } : { $addToSet: { followers: user_id } };
+    const update = alreadyFollowing
+      ? { $pull: { followers: user_id } }
+      : { $addToSet: { followers: user_id } };
 
     await coll.updateOne(query, update);
 
     if (!alreadyFollowing) {
-      setImmediate(() => notifyFollowersOfUpdate("help_requests", id, user_id, "follow", "A post you follow has a new follower."));
+      setImmediate(() =>
+        notifyFollowersOfUpdate(
+          "help_requests",
+          id,
+          user_id,
+          "follow",
+          "A post you follow has a new follower."
+        )
+      );
     }
 
-    res.json({ message: alreadyFollowing ? "Unfollowed" : "Followed", following: !alreadyFollowing });
+    res.json({
+      message: alreadyFollowing ? "Unfollowed" : "Followed",
+      following: !alreadyFollowing,
+    });
   } catch {
     res.status(500).json({ error: "Internal server error." });
   }
@@ -211,17 +309,27 @@ router.post("/:id/comments", async (req, res) => {
 
     const db = getDB();
     const { id } = req.params;
-    const query = /^[0-9a-fA-F]{24}$/.test(id) ? { _id: new ObjectId(id) } : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
     const coll = db.collection("help_requests");
     const comments = db.collection("help_comments");
 
     const helpDoc = await coll.findOne(query);
-    if (!helpDoc) return res.status(404).json({ error: "Help request not found." });
+    if (!helpDoc)
+      return res.status(404).json({ error: "Help request not found." });
 
-    const comment = { help_request_id: helpDoc._id, user_id: user_id || null, text, createdAt: new Date() };
+    const comment = {
+      help_request_id: helpDoc._id,
+      user_id: user_id || null,
+      text,
+      createdAt: new Date(),
+    };
     const result = await comments.insertOne(comment);
 
-    setImmediate(() => notifyFollowersOfUpdate("help_requests", id, user_id, "comment", text));
+    setImmediate(() =>
+      notifyFollowersOfUpdate("help_requests", id, user_id, "comment", text)
+    );
     res.status(201).json({ id: result.insertedId.toString(), ...comment });
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -232,8 +340,14 @@ router.get("/:id/comments", async (req, res) => {
   try {
     const db = getDB();
     const id = req.params.id;
-    const filter = /^[0-9a-fA-F]{24}$/.test(id) ? { help_request_id: new ObjectId(id) } : { help_request_id: id };
-    const docs = await db.collection("help_comments").find(filter).sort({ createdAt: 1 }).toArray();
+    const filter = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { help_request_id: new ObjectId(id) }
+      : { help_request_id: id };
+    const docs = await db
+      .collection("help_comments")
+      .find(filter)
+      .sort({ createdAt: 1 })
+      .toArray();
     res.json(docs.map((c) => ({ ...c, _id: c._id.toString() })));
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -244,9 +358,12 @@ router.delete("/:id", async (req, res) => {
   try {
     const db = getDB();
     const id = req.params.id;
-    const query = /^[0-9a-fA-F]{24}$/.test(id) ? { _id: new ObjectId(id) } : { _id: id };
+    const query = /^[0-9a-fA-F]{24}$/.test(id)
+      ? { _id: new ObjectId(id) }
+      : { _id: id };
     const r = await db.collection("help_requests").deleteOne(query);
-    if (!r.deletedCount) return res.status(404).json({ error: "Not found." });
+    if (!r.deletedCount)
+      return res.status(404).json({ error: "Not found." });
     res.json({ message: "Help request deleted." });
   } catch {
     res.status(500).json({ error: "Internal server error." });
