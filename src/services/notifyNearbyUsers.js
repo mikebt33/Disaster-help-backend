@@ -99,7 +99,7 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
   );
 
   const tokenSet = new Set();
-  let considered = 0, skippedNoLoc = 0, skippedCreator = 0, skippedDevice = 0;
+  let considered = 0, inside = 0, skippedNoLoc = 0, skippedCreator = 0, skippedDevice = 0;
 
   for (const u of candidates) {
     if (!u?.lastLocation?.lat || !u?.lastLocation?.lng) {
@@ -118,7 +118,7 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       continue;
     }
 
-    // ✅ Skip same device only if both have FCM tokens
+    // ✅ Skip same physical device (duplicate tokens)
     if (
       Array.isArray(doc.fcm_tokens) &&
       doc.fcm_tokens.length > 0 &&
@@ -129,24 +129,30 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       continue;
     }
 
-       for (const t of u.fcm_tokens) {
-         if (typeof t === "string" && t.length > 10 && !excludeTokens.has(t)) {
-           tokenSet.add(t);
-         }
-       }
-     }
-   }
+    // ✅ Geofence filter (Haversine distance)
+    const userRadiusMi = u.radiusMi || DEFAULT_RADIUS_MI;
+    const distMi = haversineDistanceMi(
+      eventLat,
+      eventLng,
+      u.lastLocation.lat,
+      u.lastLocation.lng
+    );
+    if (distMi > userRadiusMi) continue; // outside user’s radius
 
-   console.log(
-     `[PUSH][geo] considered=${considered}, inside=${inside}, skippedCreator=${skippedCreator}, skippedDevice=${skippedDevice}, noLoc=${skippedNoLoc}, uniqueTokens=${tokenSet.size}`
-   );
+    inside++;
 
-    if (tokens.length === 0) {
-      console.log(
-        `[PUSH][geo] ℹ️ No nearby tokens for ${collection}/${doc._id} — skipping send.`
-      );
-      return;
+    // ✅ Add valid FCM tokens
+    for (const t of u.fcm_tokens || []) {
+      if (typeof t === "string" && t.length > 10 && !excludeTokens.has(t)) {
+        tokenSet.add(t);
+      }
     }
+  }
+
+  const tokens = Array.from(tokenSet);
+  console.log(
+    `[PUSH][geo] considered=${considered}, inside=${inside}, skippedCreator=${skippedCreator}, skippedDevice=${skippedDevice}, noLoc=${skippedNoLoc}, uniqueTokens=${tokens.length}`
+  );
 
     // --- Compose notification ---
     const titleMap = {
