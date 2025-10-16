@@ -104,7 +104,18 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       }
       considered++;
 
+      // BEFORE
       if (excludeUserId && u.user_id === excludeUserId) {
+        skippedCreator++;
+        continue;
+      }
+
+      // AFTER (robust)
+      if (
+        excludeUserId &&
+        u.user_id &&
+        u.user_id.toString().trim() === excludeUserId.toString().trim()
+      ) {
         skippedCreator++;
         continue;
       }
