@@ -104,13 +104,7 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       }
       considered++;
 
-      // BEFORE
-      if (excludeUserId && u.user_id === excludeUserId) {
-        skippedCreator++;
-        continue;
-      }
-
-      // AFTER (robust)
+      // ✅ Skip the creator (normalized ID check)
       if (
         excludeUserId &&
         u.user_id &&
@@ -120,29 +114,18 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
         continue;
       }
 
-      const userRadius =
-        typeof u.radiusMi === "number" && u.radiusMi > 0
-          ? u.radiusMi
-          : DEFAULT_RADIUS_MI;
+      // ✅ Skip same physical device (duplicate tokens)
+      if (
+        Array.isArray(u.fcm_tokens) &&
+        Array.isArray(doc.fcm_tokens) &&
+        u.fcm_tokens.some(t => doc.fcm_tokens.includes(t))
+      ) {
+        continue;
+      }
 
-      const dist = haversineDistanceMi(
-        u.lastLocation.lat,
-        u.lastLocation.lng,
-        eventLat,
-        eventLng
-      );
-
-      if (!isNaN(dist) && dist <= userRadius) {
-        inside++;
-        for (const t of u.fcm_tokens || []) {
-          if (typeof t !== "string" || t.length <= 10) continue;
-
-          // ✅ Skip tokens that belong to the excluded user (creator)
-          if (excludeUserId && u.user_id === excludeUserId) continue;
-
-          // ✅ Prevent duplicate-token self notifications (same token reused across IDs)
-          if (doc.user_id && Array.isArray(doc.fcm_tokens) && doc.fcm_tokens.includes(t)) continue;
-
+      // ✅ Add valid tokens for this user
+      for (const t of u.fcm_tokens || []) {
+        if (typeof t === "string" && t.length > 10) {
           tokenSet.add(t);
         }
       }
