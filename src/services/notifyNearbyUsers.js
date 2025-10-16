@@ -124,7 +124,15 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
       if (!isNaN(dist) && dist <= userRadius) {
         inside++;
         for (const t of u.fcm_tokens || []) {
-          if (typeof t === "string" && t.length > 10) tokenSet.add(t);
+          if (typeof t !== "string" || t.length <= 10) continue;
+
+          // ✅ Skip tokens that belong to the excluded user (creator)
+          if (excludeUserId && u.user_id === excludeUserId) continue;
+
+          // ✅ Prevent duplicate-token self notifications (same token reused across IDs)
+          if (doc.user_id && Array.isArray(doc.fcm_tokens) && doc.fcm_tokens.includes(t)) continue;
+
+          tokenSet.add(t);
         }
       }
     }
