@@ -387,4 +387,4 @@ async function pollCapFeeds(){
   console.log("✅ CAP poll cycle complete.\n");
 }
 
-export { pollCapFeeds };
+export { pollCapFeeds, tryCountyCenterFromAreaDesc };
