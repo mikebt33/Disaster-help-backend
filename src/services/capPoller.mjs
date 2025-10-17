@@ -193,13 +193,34 @@ function normalizeCapAlert(entry,source){
     if (typeof descriptionText !== "string") {
       descriptionText = String(descriptionText ?? "");
     }
-    // Enhanced cleanup for USGS HTML
+
+    // ✅ Clean and format all HTML patterns (USGS & CAP)
     descriptionText = descriptionText
-      .replace(/<\/?(dl|dt|dd)>/g, " ")
-      .replace(/<[^>]*>/g, " ")
+      // Replace <dl>, <dt>, <dd> blocks with readable labels
+      .replace(/<dt>/g, "\n")           // new line before each label
+      .replace(/<\/dt>/g, ": ")
+      .replace(/<dd>/g, "")
+      .replace(/<\/dd>/g, "")
+      .replace(/<\/?dl>/g, "")
+      // Convert <br> and <p> tags to line breaks
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n")
+      // Strip all remaining tags
+      .replace(/<[^>]*>/g, "")
+      // Decode degree symbol
       .replace(/&deg;/g, "°")
-      .replace(/\s+/g, " ")
+      // Condense spaces and trim
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n\s*\n/g, "\n")
       .trim();
+
+    // Optional: prefix “Time / Location / Depth” if USGS pattern
+    if (source === "USGS" && descriptionText.match(/UTC/)) {
+      descriptionText = descriptionText.replace(/Time/g, "🕒 Time");
+      descriptionText = descriptionText.replace(/Location/g, "📍 Location");
+      descriptionText = descriptionText.replace(/Depth/g, "🌎 Depth");
+    }
+
 
     let instructionText = info?.instruction || root?.instruction || "";
     if (typeof instructionText !== "string") {
