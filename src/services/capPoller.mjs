@@ -91,37 +91,49 @@ function normalizeCapAlert(entry, source) {
     const info = Array.isArray(root?.info) ? root.info[0] : root?.info || {};
     const area = Array.isArray(info?.area) ? info.area[0] : info?.area || {};
 
-    // Polygon extraction
-    let polygonRaw = area?.polygon || area?.["cap:polygon"] || root?.polygon || info?.polygon || null;
-    if (Array.isArray(polygonRaw)) polygonRaw = polygonRaw.join(" ");
+   // Polygon extraction
+   let polygonRaw = area?.polygon || area?.["cap:polygon"] || root?.polygon || info?.polygon || null;
+   if (Array.isArray(polygonRaw)) polygonRaw = polygonRaw.join(" ");
 
-    const polygonGeom = parsePolygon(polygonRaw);
-    let geometry = polygonGeom ? polygonCentroid(polygonGeom) : null;
+   const polygonGeom = parsePolygon(polygonRaw);
+   let geometry = null;
 
-    // Fallback lat/lon
-    const lat = parseFloat(info?.lat || area?.lat);
-    const lon = parseFloat(info?.lon || area?.lon);
-    if (!geometry && !isNaN(lat) && !isNaN(lon)) {
-      geometry = { type: "Point", coordinates: [lon, lat] };
-    }
+   // 1️⃣ Use polygon centroid if available
+   if (polygonGeom) {
+     geometry = polygonCentroid(polygonGeom);
+   }
 
-    // Fallback by state center if nothing else
-    if (!geometry) {
-      const desc = area?.areaDesc || root?.areaDesc || "";
-      const match = desc.match(/\b([A-Z]{2})\b/);
-      const state = match?.[1];
-      const coords = STATE_CENTERS[state] || STATE_CENTERS.US;
-      geometry = { type: "Point", coordinates: coords };
-    }
+   // 2️⃣ Fallback: explicit lat/lon fields
+   if (!geometry) {
+     const lat = parseFloat(info?.lat || area?.lat);
+     const lon = parseFloat(info?.lon || area?.lon);
+     if (!isNaN(lat) && !isNaN(lon)) {
+       geometry = { type: "Point", coordinates: [lon, lat] };
+     }
+   }
 
-    // Bbox if polygon exists
-    let bbox = null;
-    if (polygonGeom?.coordinates?.[0]?.length > 2) {
-      const pts = polygonGeom.coordinates[0];
-      const lons = pts.map((p) => p[0]);
-      const lats = pts.map((p) => p[1]);
-      bbox = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
-    }
+   // 3️⃣ Fallback: try parsing state code from areaDesc
+   if (!geometry) {
+     const desc = area?.areaDesc || root?.areaDesc || "";
+     const stateMatch = desc.match(/\b([A-Z]{2})\b/);
+     const state = stateMatch?.[1];
+     const coords = STATE_CENTERS[state] || STATE_CENTERS.US;
+     geometry = {
+       type: "Point",
+       coordinates: coords,
+       note: `approximation for ${desc}`
+     };
+   }
+
+   // 4️⃣ Compute bounding box if polygon exists
+   let bbox = null;
+   if (polygonGeom?.coordinates?.[0]?.length > 2) {
+     const pts = polygonGeom.coordinates[0];
+     const lons = pts.map((p) => p[0]);
+     const lats = pts.map((p) => p[1]);
+     bbox = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
+   }
+
 
     return {
       identifier: root.identifier || root.id || `UNKNOWN-${Date.now()}`,
