@@ -160,14 +160,46 @@ function normalizeCapAlert(entry, source){
       }
     }
 
-    if (!geometry){
-      const desc=area?.areaDesc||root?.areaDesc||"";
-      const stateMatch=desc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/);
-      const state=stateMatch?.[1];
-      const coords=STATE_CENTERS[state]||STATE_CENTERS.US;
-      geometry={type:"Point", coordinates:coords};
-      geometryMethod=state?"state-center":"us-default";
+    // Fallback by state center (parse from areaDesc) → else US center
+    if (!geometry) {
+      const desc = (area?.areaDesc || root?.areaDesc || "").toLowerCase();
+
+      // State name → abbreviation map for broader detection
+      const STATE_NAMES = {
+        alabama: "AL", alaska: "AK", arizona: "AZ", arkansas: "AR", california: "CA",
+        colorado: "CO", connecticut: "CT", delaware: "DE", "district of columbia": "DC",
+        florida: "FL", georgia: "GA", hawaii: "HI", idaho: "ID", illinois: "IL",
+        indiana: "IN", iowa: "IA", kansas: "KS", kentucky: "KY", louisiana: "LA",
+        maine: "ME", maryland: "MD", massachusetts: "MA", michigan: "MI", minnesota: "MN",
+        mississippi: "MS", missouri: "MO", montana: "MT", nebraska: "NE", nevada: "NV",
+        "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+        "north carolina": "NC", "north dakota": "ND", ohio: "OH", oklahoma: "OK",
+        oregon: "OR", pennsylvania: "PA", "rhode island": "RI", "south carolina": "SC",
+        "south dakota": "SD", tennessee: "TN", texas: "TX", utah: "UT", vermont: "VT",
+        virginia: "VA", washington: "WA", "west virginia": "WV", wisconsin: "WI",
+        wyoming: "WY", "puerto rico": "PR", guam: "GU", "american samoa": "AS",
+        "northern mariana islands": "MP", "virgin islands": "VI"
+      };
+
+      // 1️⃣ Try abbreviation (fast path)
+      let match = desc.match(/\b(al|ak|az|ar|ca|co|ct|de|dc|fl|ga|hi|id|il|in|ia|ks|ky|la|me|md|ma|mi|mn|ms|mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wa|wv|wi|wy|pr|gu|as|mp|vi)\b/);
+      let state = match ? match[1].toUpperCase() : null;
+
+      // 2️⃣ Try full state name
+      if (!state) {
+        for (const [name, abbr] of Object.entries(STATE_NAMES)) {
+          if (desc.includes(name)) {
+            state = abbr;
+            break;
+          }
+        }
+      }
+
+      const coords = STATE_CENTERS[state] || STATE_CENTERS.US;
+      geometry = { type: "Point", coordinates: coords };
+      geometryMethod = state ? "state-center" : "us-default";
     }
+
 
     let bbox=null;
     if (polygonGeom?.coordinates?.[0]?.length>2){
