@@ -1,6 +1,7 @@
 import axios from "axios";
 import { XMLParser } from "fast-xml-parser";
 import { getDB } from "../db.js";
+import countyCenters from "../data/county_centers.json" assert { type: "json" };
 
 /**
  * CAP Alert Poller Service — NWS / FEMA / USGS
@@ -148,6 +149,23 @@ function normalizeCapAlert(entry,source){
       if(!isNaN(lat)&&!isNaN(lon)){
         geometry={type:"Point",coordinates:[lon,lat]};
         geometryMethod="explicit-latlon";
+      }
+    }
+
+    // --- County center lookup ---
+    if (!geometry && area?.areaDesc) {
+      const desc = area.areaDesc;
+      const regions = desc.split(/[,;]+/).map(s => s.trim());
+      for (const r of regions) {
+        const match = r.match(/^([\w' \-]+),\s*([A-Z]{2})$/);
+        if (match) {
+          const [, countyName, state] = match;
+          if (countyCenters[state]?.[countyName]) {
+            geometry = { type: "Point", coordinates: countyCenters[state][countyName] };
+            geometryMethod = "county-center";
+            break;
+          }
+        }
       }
     }
 
@@ -301,23 +319,3 @@ async function fetchCapFeed(feed){
     const res=await axios.get(feed.url,{timeout:20000});
     const xml=res.data;
     const parser=new XMLParser({ignoreAttributes:false,removeNSPrefix:true});
-    const json=parser.parse(xml);
-    let entries=json.alert?[json.alert]:json.feed?.entry||[];
-    if(!Array.isArray(entries))entries=[entries];
-    const alerts=entries.map(e=>normalizeCapAlert(e,feed.source)).filter(Boolean);
-    const usable=alerts.filter(a=>a.hasGeometry).length;
-    console.log(`✅ Parsed ${alerts.length} alerts from ${feed.source} (${usable} usable geo)`);
-    if(alerts.length)await saveAlerts(alerts);
-  }catch(err){
-    console.error(`❌ Error fetching ${feed.name}:`,err.message);
-  }
-}
-
-/** Run all feeds */
-async function pollCapFeeds(){
-  console.log("🚨 CAP Poller running...");
-  for(const feed of CAP_FEEDS)await fetchCapFeed(feed);
-  console.log("✅ CAP poll cycle complete.\n");
-}
-
-export { pollCapFeeds };
