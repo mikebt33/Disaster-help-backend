@@ -168,7 +168,8 @@ function normalizeCapAlert(entry,source){
       bbox=[Math.min(...lons),Math.min(...lats),Math.max(...lons),Math.max(...lats)];
     }
 
-    // --- Human readable event / title ---
+    // --- Event labeling + expiration logic for USGS ---
+    let expires = info?.expires || root?.expires || null;
     let eventName =
       info?.event ||
       root?.event ||
@@ -176,8 +177,28 @@ function normalizeCapAlert(entry,source){
       (root.summary && root.summary.split(" issued")[0]) ||
       "Alert";
 
-    // Label USGS alerts as Earthquake
-    if (source === "USGS" && eventName === "Alert") eventName = "Earthquake";
+    if (source === "USGS") {
+      const magMatch = root?.title?.match(/M\s?(\d+\.\d+)/);
+      const magnitude = magMatch ? parseFloat(magMatch[1]) : null;
+
+      if (magnitude !== null) {
+        const sentTime = new Date(info?.effective || root.sent || root.updated || Date.now());
+        if (magnitude < 3.0) {
+          eventName = `Seismic Activity (M ${magnitude})`;
+          expires = new Date(sentTime.getTime() + 10 * 60 * 1000); // 10 minutes
+        } else if (magnitude < 5.0) {
+          eventName = `Minor Earthquake (M ${magnitude})`;
+          expires = new Date(sentTime.getTime() + 60 * 60 * 1000); // 1 hour
+        } else {
+          eventName = `Earthquake (M ${magnitude})`;
+          expires = new Date(sentTime.getTime() + 3 * 60 * 60 * 1000); // 3 hours
+        }
+      } else {
+        eventName = "Seismic Activity";
+        const sentTime = new Date(info?.effective || root.sent || root.updated || Date.now());
+        expires = new Date(sentTime.getTime() + 10 * 60 * 1000); // 10 minutes
+      }
+    }
 
     const headlineText =
       info?.headline ||
@@ -193,34 +214,25 @@ function normalizeCapAlert(entry,source){
     if (typeof descriptionText !== "string") {
       descriptionText = String(descriptionText ?? "");
     }
-
-    // ✅ Clean and format all HTML patterns (USGS & CAP)
     descriptionText = descriptionText
-      // Replace <dl>, <dt>, <dd> blocks with readable labels
-      .replace(/<dt>/g, "\n")           // new line before each label
+      .replace(/<dt>/g, "\n")
       .replace(/<\/dt>/g, ": ")
       .replace(/<dd>/g, "")
       .replace(/<\/dd>/g, "")
       .replace(/<\/?dl>/g, "")
-      // Convert <br> and <p> tags to line breaks
       .replace(/<br\s*\/?>/gi, "\n")
       .replace(/<\/p>/gi, "\n")
-      // Strip all remaining tags
       .replace(/<[^>]*>/g, "")
-      // Decode degree symbol
       .replace(/&deg;/g, "°")
-      // Condense spaces and trim
       .replace(/[ \t]+/g, " ")
       .replace(/\n\s*\n/g, "\n")
       .trim();
 
-    // Optional: prefix “Time / Location / Depth” if USGS pattern
     if (source === "USGS" && descriptionText.match(/UTC/)) {
       descriptionText = descriptionText.replace(/Time/g, "🕒 Time");
       descriptionText = descriptionText.replace(/Location/g, "📍 Location");
       descriptionText = descriptionText.replace(/Depth/g, "🌎 Depth");
     }
-
 
     let instructionText = info?.instruction || root?.instruction || "";
     if (typeof instructionText !== "string") {
@@ -230,9 +242,9 @@ function normalizeCapAlert(entry,source){
     const infoBlock = {
       category: info?.category || "General",
       event: eventName.trim(),
-      urgency: info?.urgency || "Unknown",
-      severity: info?.severity || "Unknown",
-      certainty: info?.certainty || "Unknown",
+      urgency: info?.urgency || (source === "USGS" ? "Past" : "Unknown"),
+      severity: info?.severity || (source === "USGS" ? "Minor" : "Unknown"),
+      certainty: info?.certainty || (source === "USGS" ? "Observed" : "Unknown"),
       headline: headlineText.trim(),
       description: descriptionText.trim(),
       instruction: instructionText.trim(),
@@ -255,7 +267,7 @@ function normalizeCapAlert(entry,source){
       summary:descriptionText.trim(),
       source,
       timestamp:new Date(),
-      expires:info?.expires||root?.expires||null,
+      expires,
     };
   }catch(err){
     console.error("❌ Error normalizing CAP alert:",err.message);
