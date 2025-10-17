@@ -65,8 +65,7 @@ const medianAbs = (arr) => {
 function detectLonLatOrder(pairs) {
   const aOutsideLat = pairs.reduce((c,[a]) => c + (Math.abs(a) > 90 ? 1 : 0), 0);
   const bOutsideLat = pairs.reduce((c,[,b]) => c + (Math.abs(b) > 90 ? 1 : 0), 0);
-  if (aOutsideLat !== bOutsideLat)
-    return aOutsideLat > bOutsideLat ? "lonlat" : "latlon";
+  if (aOutsideLat !== bOutsideLat) return aOutsideLat > bOutsideLat ? "lonlat" : "latlon";
   const aMed = medianAbs(pairs.map(([a]) => a));
   const bMed = medianAbs(pairs.map(([,b]) => b));
   return (aMed - bMed) > (bMed - aMed) ? "lonlat" : "latlon";
@@ -122,13 +121,9 @@ function polygonCentroid(geometry){
 function normalizeCountyName(raw) {
   if (!raw) return "";
   let s = String(raw).trim();
-
-  // Normalize common affixes/suffixes
   s = s.replace(/^City of\s+/i, "");
   s = s.replace(/\s+(County|Parish|Borough|Census Area|Municipio|Municipality|City)$/i, "");
-  // St./St  -> Saint
   s = s.replace(/^St[.\s]+/i, "Saint ");
-  // Condense spaces, strip periods
   s = s.replace(/\./g, "").replace(/\s+/g, " ").trim();
   return s;
 }
@@ -136,14 +131,11 @@ function normalizeCountyName(raw) {
 function tryCountyCenterFromAreaDesc(areaDesc) {
   if (!areaDesc) return null;
 
-  // Try to detect a "global" state in the desc (used for items missing state)
   const stateInDesc = (areaDesc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/) || [])[0];
 
-  // Split Horry, SC; Marion, SC  OR  "Horry County, SC; Marion County, SC"
   const regions = areaDesc.split(/[,;]+/).map(s => s.trim()).filter(Boolean);
 
   for (const r of regions) {
-    // Prefer explicit "County, ST" (or "Parish/Borough/City, ST")
     let m = r.match(/^(.+?),\s*([A-Z]{2})$/);
     if (m) {
       const county = normalizeCountyName(m[1]);
@@ -153,7 +145,6 @@ function tryCountyCenterFromAreaDesc(areaDesc) {
       }
     }
 
-    // If this piece is just a county name and we inferred a state earlier, try that.
     if (stateInDesc && /^[A-Za-z .'-]+$/.test(r)) {
       const countyOnly = normalizeCountyName(r);
       if (countyCenters[stateInDesc]?.[countyOnly]) {
@@ -181,6 +172,7 @@ function normalizeCapAlert(entry,source){
     // --- Geometry ---
     let geometry=null;
     let geometryMethod=null;
+
     if(polygonGeom){
       geometry=polygonCentroid(polygonGeom);
       geometryMethod="polygon";
@@ -217,23 +209,23 @@ function normalizeCapAlert(entry,source){
       }
     }
 
-   // --- Fallback to state center first, then U.S. center ---
-   if (!geometry) {
-     const desc = area?.areaDesc || root?.areaDesc || "";
-     const stateMatch = desc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/);
-     const state = stateMatch?.[1];
+    // --- Fallback to state center (2-letter code only) ---
+    if(!geometry){
+      const desc=area?.areaDesc||root?.areaDesc||"";
+      const stateMatch=desc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/);
+      const state=stateMatch?.[1];
+      if (state && STATE_CENTERS[state]) {
+        geometry={type:"Point",coordinates:STATE_CENTERS[state]};
+        geometryMethod="state-center";
+        console.log(`🗺️ Fallback to state center: ${state} (${area.areaDesc})`);
+      }
+    }
 
-     if (state && STATE_CENTERS[state]) {
-       geometry = { type: "Point", coordinates: STATE_CENTERS[state] };
-       geometryMethod = "state-center";
-       console.log(`🗺️ Fallback to state center: ${state} (${area.areaDesc})`);
-     } else {
-       geometry = { type: "Point", coordinates: STATE_CENTERS.US };
-       geometryMethod = "us-default";
-       console.warn(`⚠️ Fallback to U.S. default (Kansas): ${area.areaDesc}`);
-     }
-   }
-
+    // --- Skip if still no valid geometry (no polygon/point/latlon/county/state) ---
+    if (!geometry) {
+      console.warn(`🚫 Skipping alert with no geo/county/state: ${area.areaDesc || "(no areaDesc)"}`);
+      return null;
+    }
 
     // --- Bounding box ---
     let bbox=null;
@@ -337,7 +329,7 @@ function normalizeCapAlert(entry,source){
       geometry,
       geometryMethod,
       bbox,
-      hasGeometry:geometryMethod!=="us-default",
+      hasGeometry:true,
       title:headlineText.trim(),
       summary:descriptionText.trim(),
       source,
