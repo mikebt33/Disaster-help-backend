@@ -212,15 +212,34 @@ function normalizeCapAlert(entry, source) {
       msgType: root.msgType || "Alert",
       scope: root.scope || "Public",
       info: {
-        category: info?.category || "General",
-        event: info?.event || root.event || "Alert",
-        urgency: info?.urgency || "Unknown",
-        severity: info?.severity || "Unknown",
-        certainty: info?.certainty || "Unknown",
-        headline: info?.headline || root.title || "",
-        description: descRaw,
-        instruction: info?.instruction || "",
-      },
+       // Derive the most human-readable event type and title
+       const eventName =
+         info?.event ||
+         root?.event ||
+         (root.title && root.title.split(" issued")[0]) ||
+         (root.summary && root.summary.split(" issued")[0]) ||
+         "Alert";
+
+       const headlineText =
+         info?.headline ||
+         root?.title ||
+         root?.summary ||
+         eventName;
+
+       info: {
+         category: info?.category || "General",
+         event: eventName.trim(),
+         urgency: info?.urgency || "Unknown",
+         severity: info?.severity || "Unknown",
+         certainty: info?.certainty || "Unknown",
+         headline: headlineText.trim(),
+         description:
+           typeof info?.description === "string"
+             ? info.description
+             : info?.description?.["#text"] || "",
+         instruction: info?.instruction || "",
+       },
+
       area: {
         areaDesc: area?.areaDesc || info?.areaDesc || root.areaDesc || "",
         polygon: polygonRaw || null,
