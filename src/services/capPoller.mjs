@@ -61,9 +61,7 @@ function detectLonLatOrder(pairs) {
     return aOutsideLat > bOutsideLat ? "lonlat" : "latlon";
   const aMed = medianAbs(pairs.map(([a]) => a));
   const bMed = medianAbs(pairs.map(([,b]) => b));
-  const latlonScore = bMed - aMed;
-  const lonlatScore = aMed - bMed;
-  return lonlatScore > latlonScore ? "lonlat" : "latlon";
+  return (aMed - bMed) > (bMed - aMed) ? "lonlat" : "latlon";
 }
 
 function parsePolygon(polygonString) {
@@ -170,18 +168,6 @@ function normalizeCapAlert(entry,source){
       bbox=[Math.min(...lons),Math.min(...lats),Math.max(...lons),Math.max(...lats)];
     }
 
-    // --- Clean description / summary ---
-    let descRaw=info?.description||root.summary||root.content||"";
-    if(typeof descRaw==="object"&&descRaw["#text"])descRaw=descRaw["#text"];
-    if(typeof descRaw==="string"){
-      descRaw=descRaw.replace(/<[^>]*>/g," ").replace(/&deg;/g,"°").replace(/\s+/g," ").trim();
-    }
-    let summaryClean=root.summary||info?.description||info?.headline||"";
-    if(typeof summaryClean==="object"&&summaryClean["#text"])summaryClean=summaryClean["#text"];
-    if(typeof summaryClean==="string"){
-      summaryClean=summaryClean.replace(/<[^>]*>/g," ").replace(/&deg;/g,"°").replace(/\s+/g," ").trim();
-    }
-
     // --- Human readable event / title ---
     let eventName =
       info?.event ||
@@ -190,10 +176,8 @@ function normalizeCapAlert(entry,source){
       (root.summary && root.summary.split(" issued")[0]) ||
       "Alert";
 
-    // If this is a USGS GeoRSS feed, label as Earthquake when event is generic
-    if (source === "USGS" && eventName === "Alert") {
-      eventName = "Earthquake";
-    }
+    // Label USGS alerts as Earthquake
+    if (source === "USGS" && eventName === "Alert") eventName = "Earthquake";
 
     const headlineText =
       info?.headline ||
@@ -201,7 +185,7 @@ function normalizeCapAlert(entry,source){
       root?.summary ||
       eventName;
 
-    // Normalize description so it's always a string
+    // --- Description cleanup ---
     let descriptionText = info?.description || root?.summary || root?.content || "";
     if (typeof descriptionText === "object" && descriptionText["#text"]) {
       descriptionText = descriptionText["#text"];
@@ -209,6 +193,13 @@ function normalizeCapAlert(entry,source){
     if (typeof descriptionText !== "string") {
       descriptionText = String(descriptionText ?? "");
     }
+    // Enhanced cleanup for USGS HTML
+    descriptionText = descriptionText
+      .replace(/<\/?(dl|dt|dd)>/g, " ")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/&deg;/g, "°")
+      .replace(/\s+/g, " ")
+      .trim();
 
     let instructionText = info?.instruction || root?.instruction || "";
     if (typeof instructionText !== "string") {
@@ -240,7 +231,7 @@ function normalizeCapAlert(entry,source){
       bbox,
       hasGeometry:geometryMethod!=="us-default",
       title:headlineText.trim(),
-      summary:summaryClean,
+      summary:descriptionText.trim(),
       source,
       timestamp:new Date(),
       expires:info?.expires||root?.expires||null,
