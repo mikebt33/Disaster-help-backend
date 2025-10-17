@@ -1,7 +1,14 @@
 import axios from "axios";
 import { XMLParser } from "fast-xml-parser";
 import { getDB } from "../db.js";
-import countyCenters from "../data/county_centers.json" assert { type: "json" };
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const countyCentersPath = path.resolve(__dirname, "../data/county_centers.json");
+const countyCenters = JSON.parse(fs.readFileSync(countyCentersPath, "utf8"));
 
 /**
  * CAP Alert Poller Service — NWS / FEMA / USGS
