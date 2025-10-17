@@ -23,7 +23,7 @@ const CAP_FEEDS = [
   })),
 ];
 
-/** Convert polygon strings into GeoJSON Polygon */
+/** Parse a CAP polygon string into GeoJSON Polygon (supports both lat,lon and lon,lat) */
 function parsePolygon(polygonString) {
   if (!polygonString) return null;
   try {
@@ -31,25 +31,31 @@ function parsePolygon(polygonString) {
       .trim()
       .split(/\s+/)
       .map((p) => {
-        const [lat, lon] = p.split(",");
-        return [parseFloat(lon), parseFloat(lat)];
+        const [a, b] = p.split(",").map(Number);
+        // Guess if order is lat,lon or lon,lat (CAP spec is lat,lon)
+        return Math.abs(a) <= 90 && Math.abs(b) > 90 ? [b, a] : [a, b];
       })
       .filter((c) => c.length === 2 && !isNaN(c[0]) && !isNaN(c[1]));
     if (coords.length < 3) return null;
-    if (coords[0][0] !== coords[coords.length - 1][0]) coords.push(coords[0]);
+    // Close polygon if not closed
+    const first = coords[0];
+    const last = coords[coords.length - 1];
+    if (first[0] !== last[0] || first[1] !== last[1]) coords.push(first);
     return { type: "Polygon", coordinates: [coords] };
-  } catch {
+  } catch (err) {
+    console.warn("⚠️ Failed to parse polygon:", err.message);
     return null;
   }
 }
 
-/** Compute centroid from Polygon */
+/** Compute centroid from GeoJSON Polygon */
 function polygonCentroid(geometry) {
   if (!geometry || geometry.type !== "Polygon") return null;
   const pts = geometry.coordinates[0];
   let x = 0, y = 0, z = 0;
   for (const [lon, lat] of pts) {
-    const latR = (lat * Math.PI) / 180, lonR = (lon * Math.PI) / 180;
+    const latR = (lat * Math.PI) / 180;
+    const lonR = (lon * Math.PI) / 180;
     x += Math.cos(latR) * Math.cos(lonR);
     y += Math.cos(latR) * Math.sin(lonR);
     z += Math.sin(latR);
@@ -69,17 +75,17 @@ const STATE_CENTERS = {
   GA: [-83.4412, 32.1656], AL: [-86.9023, 32.8067], OH: [-82.9071, 40.4173],
   PA: [-77.1945, 41.2033], MI: [-84.5361, 44.1822], LA: [-91.9623, 30.9843],
   IL: [-89.3985, 40.6331], IN: [-86.1349, 40.2672], SC: [-81.1637, 33.8361],
-  KY: [-84.2700, 37.8393], TN: [-86.5804, 35.5175], AR: [-92.3731, 34.9697],
+  KY: [-84.27, 37.8393], TN: [-86.5804, 35.5175], AR: [-92.3731, 34.9697],
   AZ: [-111.0937, 34.0489], CO: [-105.7821, 39.5501], WA: [-120.7401, 47.7511],
   OR: [-120.5542, 43.8041], NV: [-116.4194, 38.8026], OK: [-97.0929, 35.0078],
   MO: [-91.8318, 38.5739], WI: [-89.6165, 44.7863], MN: [-94.6859, 46.7296],
-  IA: [-93.0977, 41.8780], KS: [-98.4842, 39.0119], ME: [-69.4455, 45.2538],
+  IA: [-93.0977, 41.878], KS: [-98.4842, 39.0119], ME: [-69.4455, 45.2538],
   VT: [-72.5778, 44.5588], NH: [-71.5724, 43.1939], MA: [-71.3824, 42.4072],
   CT: [-72.6979, 41.6032], RI: [-71.4774, 41.5801], DE: [-75.5277, 38.9108],
   MD: [-76.6413, 39.0458], WV: [-80.4549, 38.5976], ND: [-100.5407, 47.5515],
   SD: [-99.9018, 43.9695], MT: [-110.3626, 46.8797], NE: [-99.9018, 41.4925],
-  NM: [-105.8701, 34.5199], WY: [-107.2903, 43.0759], ID: [-114.7420, 44.0682],
-  UT: [-111.0937, 39.3200], AK: [-152.4044, 64.2008], HI: [-155.5828, 19.8968],
+  NM: [-105.8701, 34.5199], WY: [-107.2903, 43.0759], ID: [-114.742, 44.0682],
+  UT: [-111.0937, 39.32], AK: [-152.4044, 64.2008], HI: [-155.5828, 19.8968],
   PR: [-66.5901, 18.2208], GU: [144.7937, 13.4443], VI: [-64.8963, 18.3358],
   US: [-98.5795, 39.8283],
 };
@@ -91,49 +97,40 @@ function normalizeCapAlert(entry, source) {
     const info = Array.isArray(root?.info) ? root.info[0] : root?.info || {};
     const area = Array.isArray(info?.area) ? info.area[0] : info?.area || {};
 
-   // Polygon extraction
-   let polygonRaw = area?.polygon || area?.["cap:polygon"] || root?.polygon || info?.polygon || null;
-   if (Array.isArray(polygonRaw)) polygonRaw = polygonRaw.join(" ");
+    // --- Geometry resolution ---
+    let polygonRaw = area?.polygon || area?.["cap:polygon"] || root?.polygon || info?.polygon || null;
+    if (Array.isArray(polygonRaw)) polygonRaw = polygonRaw.join(" ");
 
-   const polygonGeom = parsePolygon(polygonRaw);
-   let geometry = null;
+    let polygonGeom = parsePolygon(polygonRaw);
+    let geometry = null;
 
-   // 1️⃣ Use polygon centroid if available
-   if (polygonGeom) {
-     geometry = polygonCentroid(polygonGeom);
-   }
+    // 1️⃣ Use polygon centroid if valid polygon exists
+    if (polygonGeom) geometry = polygonCentroid(polygonGeom);
 
-   // 2️⃣ Fallback: explicit lat/lon fields
-   if (!geometry) {
-     const lat = parseFloat(info?.lat || area?.lat);
-     const lon = parseFloat(info?.lon || area?.lon);
-     if (!isNaN(lat) && !isNaN(lon)) {
-       geometry = { type: "Point", coordinates: [lon, lat] };
-     }
-   }
+    // 2️⃣ Try explicit lat/lon fields
+    if (!geometry) {
+      const lat = parseFloat(info?.lat || area?.lat);
+      const lon = parseFloat(info?.lon || area?.lon);
+      if (!isNaN(lat) && !isNaN(lon)) geometry = { type: "Point", coordinates: [lon, lat] };
+    }
 
-   // 3️⃣ Fallback: try parsing state code from areaDesc
-   if (!geometry) {
-     const desc = area?.areaDesc || root?.areaDesc || "";
-     const stateMatch = desc.match(/\b([A-Z]{2})\b/);
-     const state = stateMatch?.[1];
-     const coords = STATE_CENTERS[state] || STATE_CENTERS.US;
-     geometry = {
-       type: "Point",
-       coordinates: coords,
-       note: `approximation for ${desc}`
-     };
-   }
+    // 3️⃣ Fallback: derive from state code or US center
+    if (!geometry) {
+      const desc = area?.areaDesc || root?.areaDesc || "";
+      const stateMatch = desc.match(/\b([A-Z]{2})\b/);
+      const state = stateMatch?.[1];
+      const coords = STATE_CENTERS[state] || STATE_CENTERS.US;
+      geometry = { type: "Point", coordinates: coords };
+    }
 
-   // 4️⃣ Compute bounding box if polygon exists
-   let bbox = null;
-   if (polygonGeom?.coordinates?.[0]?.length > 2) {
-     const pts = polygonGeom.coordinates[0];
-     const lons = pts.map((p) => p[0]);
-     const lats = pts.map((p) => p[1]);
-     bbox = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
-   }
-
+    // 4️⃣ Compute bbox if polygon exists
+    let bbox = null;
+    if (polygonGeom?.coordinates?.[0]?.length > 2) {
+      const pts = polygonGeom.coordinates[0];
+      const lons = pts.map((p) => p[0]);
+      const lats = pts.map((p) => p[1]);
+      bbox = [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
+    }
 
     return {
       identifier: root.identifier || root.id || `UNKNOWN-${Date.now()}`,
@@ -171,26 +168,19 @@ function normalizeCapAlert(entry, source) {
   }
 }
 
-/** Save parsed alerts into MongoDB (with geometry + bbox) */
+/** Save parsed alerts into MongoDB */
 async function saveAlerts(alerts) {
   try {
     const db = getDB();
     const collection = db.collection("alerts_cap");
+    const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000);
+
+    await collection.deleteMany({ sent: { $lt: cutoff } });
 
     for (const alert of alerts) {
-      const doc = { ...alert };
-
-      // ✅ Guarantee geometry/bbox are saved
-      if (alert.geometry) doc.geometry = alert.geometry;
-      if (alert.bbox) doc.bbox = alert.bbox;
-
-      // Cleanup older ones (72 hours)
-      const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000);
-      await collection.deleteMany({ sent: { $lt: cutoff } });
-
       await collection.updateOne(
         { identifier: alert.identifier },
-        { $set: doc },
+        { $set: alert },
         { upsert: true }
       );
     }
@@ -214,7 +204,6 @@ async function fetchCapFeed(feed) {
     if (!Array.isArray(entries)) entries = [entries];
 
     const alerts = entries.map((e) => normalizeCapAlert(e, feed.source)).filter(Boolean);
-
     const withGeom = alerts.filter((a) => a.geometry).length;
     console.log(`✅ Parsed ${alerts.length} alerts from ${feed.source} (${withGeom} with geometry)`);
 
