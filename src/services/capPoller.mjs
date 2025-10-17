@@ -117,6 +117,54 @@ function polygonCentroid(geometry){
   return{type:"Point",coordinates:[lon*(180/Math.PI),lat*(180/Math.PI)]};
 }
 
+/* ------------------- County helpers ------------------- */
+
+function normalizeCountyName(raw) {
+  if (!raw) return "";
+  let s = String(raw).trim();
+
+  // Normalize common affixes/suffixes
+  s = s.replace(/^City of\s+/i, "");
+  s = s.replace(/\s+(County|Parish|Borough|Census Area|Municipio|Municipality|City)$/i, "");
+  // St./St  -> Saint
+  s = s.replace(/^St[.\s]+/i, "Saint ");
+  // Condense spaces, strip periods
+  s = s.replace(/\./g, "").replace(/\s+/g, " ").trim();
+  return s;
+}
+
+function tryCountyCenterFromAreaDesc(areaDesc) {
+  if (!areaDesc) return null;
+
+  // Try to detect a "global" state in the desc (used for items missing state)
+  const stateInDesc = (areaDesc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/) || [])[0];
+
+  // Split Horry, SC; Marion, SC  OR  "Horry County, SC; Marion County, SC"
+  const regions = areaDesc.split(/[,;]+/).map(s => s.trim()).filter(Boolean);
+
+  for (const r of regions) {
+    // Prefer explicit "County, ST" (or "Parish/Borough/City, ST")
+    let m = r.match(/^(.+?),\s*([A-Z]{2})$/);
+    if (m) {
+      const county = normalizeCountyName(m[1]);
+      const st = m[2];
+      if (countyCenters[st]?.[county]) {
+        return { type: "Point", coordinates: countyCenters[st][county] };
+      }
+    }
+
+    // If this piece is just a county name and we inferred a state earlier, try that.
+    if (stateInDesc && /^[A-Za-z .'-]+$/.test(r)) {
+      const countyOnly = normalizeCountyName(r);
+      if (countyCenters[stateInDesc]?.[countyOnly]) {
+        return { type: "Point", coordinates: countyCenters[stateInDesc][countyOnly] };
+      }
+    }
+  }
+
+  return null;
+}
+
 /* ------------------- Normalization ------------------- */
 
 function normalizeCapAlert(entry,source){
@@ -159,23 +207,16 @@ function normalizeCapAlert(entry,source){
       }
     }
 
-    // --- County center lookup ---
+    // --- County center lookup to avoid US centroid stacking ---
     if (!geometry && area?.areaDesc) {
-      const desc = area.areaDesc;
-      const regions = desc.split(/[,;]+/).map(s => s.trim());
-      for (const r of regions) {
-        const match = r.match(/^([\w' \-]+),\s*([A-Z]{2})$/);
-        if (match) {
-          const [, countyName, state] = match;
-          if (countyCenters[state]?.[countyName]) {
-            geometry = { type: "Point", coordinates: countyCenters[state][countyName] };
-            geometryMethod = "county-center";
-            break;
-          }
-        }
+      const countyPoint = tryCountyCenterFromAreaDesc(area.areaDesc);
+      if (countyPoint) {
+        geometry = countyPoint;
+        geometryMethod = "county-center";
       }
     }
 
+    // --- Fallback to state center, else US center ---
     if(!geometry){
       const desc=area?.areaDesc||root?.areaDesc||"";
       const stateMatch=desc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/);
@@ -185,6 +226,7 @@ function normalizeCapAlert(entry,source){
       geometryMethod=state?"state-center":"us-default";
     }
 
+    // --- Bounding box ---
     let bbox=null;
     if(polygonGeom?.coordinates?.[0]?.length>2){
       const pts=polygonGeom.coordinates[0];
@@ -193,7 +235,7 @@ function normalizeCapAlert(entry,source){
       bbox=[Math.min(...lons),Math.min(...lats),Math.max(...lons),Math.max(...lats)];
     }
 
-    // --- Event labeling + expiration logic for USGS ---
+    // --- Event labeling + expiration logic (USGS short TTLs) ---
     let expires = info?.expires || root?.expires || null;
     let eventName =
       info?.event ||
@@ -205,9 +247,9 @@ function normalizeCapAlert(entry,source){
     if (source === "USGS") {
       const magMatch = root?.title?.match(/M\s?(\d+\.\d+)/);
       const magnitude = magMatch ? parseFloat(magMatch[1]) : null;
+      const sentTime = new Date(info?.effective || root.sent || root.updated || Date.now());
 
       if (magnitude !== null) {
-        const sentTime = new Date(info?.effective || root.sent || root.updated || Date.now());
         if (magnitude < 3.0) {
           eventName = `Seismic Activity (M ${magnitude})`;
           expires = new Date(sentTime.getTime() + 10 * 60 * 1000); // 10 minutes
@@ -220,7 +262,6 @@ function normalizeCapAlert(entry,source){
         }
       } else {
         eventName = "Seismic Activity";
-        const sentTime = new Date(info?.effective || root.sent || root.updated || Date.now());
         expires = new Date(sentTime.getTime() + 10 * 60 * 1000); // 10 minutes
       }
     }
@@ -326,3 +367,23 @@ async function fetchCapFeed(feed){
     const res=await axios.get(feed.url,{timeout:20000});
     const xml=res.data;
     const parser=new XMLParser({ignoreAttributes:false,removeNSPrefix:true});
+    const json=parser.parse(xml);
+    let entries=json.alert?[json.alert]:json.feed?.entry||[];
+    if(!Array.isArray(entries))entries=[entries];
+    const alerts=entries.map(e=>normalizeCapAlert(e,feed.source)).filter(Boolean);
+    const usable=alerts.filter(a=>a.hasGeometry).length;
+    console.log(`✅ Parsed ${alerts.length} alerts from ${feed.source} (${usable} usable geo)`);
+    if(alerts.length)await saveAlerts(alerts);
+  }catch(err){
+    console.error(`❌ Error fetching ${feed.name}:`,err.message);
+  }
+}
+
+/** Run all feeds */
+async function pollCapFeeds(){
+  console.log("🚨 CAP Poller running...");
+  for(const feed of CAP_FEEDS)await fetchCapFeed(feed);
+  console.log("✅ CAP poll cycle complete.\n");
+}
+
+export { pollCapFeeds };
