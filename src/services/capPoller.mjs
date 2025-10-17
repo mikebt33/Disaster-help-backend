@@ -217,15 +217,23 @@ function normalizeCapAlert(entry,source){
       }
     }
 
-    // --- Fallback to state center, else US center ---
-    if(!geometry){
-      const desc=area?.areaDesc||root?.areaDesc||"";
-      const stateMatch=desc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/);
-      const state=stateMatch?.[1];
-      const coords=STATE_CENTERS[state]||STATE_CENTERS.US;
-      geometry={type:"Point",coordinates:coords};
-      geometryMethod=state?"state-center":"us-default";
-    }
+   // --- Fallback to state center first, then U.S. center ---
+   if (!geometry) {
+     const desc = area?.areaDesc || root?.areaDesc || "";
+     const stateMatch = desc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/);
+     const state = stateMatch?.[1];
+
+     if (state && STATE_CENTERS[state]) {
+       geometry = { type: "Point", coordinates: STATE_CENTERS[state] };
+       geometryMethod = "state-center";
+       console.log(`🗺️ Fallback to state center: ${state} (${area.areaDesc})`);
+     } else {
+       geometry = { type: "Point", coordinates: STATE_CENTERS.US };
+       geometryMethod = "us-default";
+       console.warn(`⚠️ Fallback to U.S. default (Kansas): ${area.areaDesc}`);
+     }
+   }
+
 
     // --- Bounding box ---
     let bbox=null;
