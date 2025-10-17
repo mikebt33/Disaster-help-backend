@@ -213,6 +213,7 @@ function normalizeCapAlert(entry,source){
       if (countyPoint) {
         geometry = countyPoint;
         geometryMethod = "county-center";
+        console.log(`✅ County-center match: ${area.areaDesc}`);
       }
     }
 
