@@ -201,14 +201,19 @@ function normalizeCapAlert(entry,source){
       root?.summary ||
       eventName;
 
-    const descriptionText =
-      typeof info?.description === "string"
-        ? info.description
-        : info?.description?.["#text"] || root?.summary || "";
+    // Normalize description so it's always a string
+    let descriptionText = info?.description || root?.summary || root?.content || "";
+    if (typeof descriptionText === "object" && descriptionText["#text"]) {
+      descriptionText = descriptionText["#text"];
+    }
+    if (typeof descriptionText !== "string") {
+      descriptionText = String(descriptionText ?? "");
+    }
 
-    const instructionText =
-      info?.instruction ||
-      (typeof root?.instruction === "string" ? root.instruction : "");
+    let instructionText = info?.instruction || root?.instruction || "";
+    if (typeof instructionText !== "string") {
+      instructionText = String(instructionText ?? "");
+    }
 
     const infoBlock = {
       category: info?.category || "General",
