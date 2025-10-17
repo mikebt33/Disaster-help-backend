@@ -1,3 +1,4 @@
+// src/services/capPoller.mjs
 import axios from "axios";
 import { XMLParser } from "fast-xml-parser";
 import { getDB } from "../db.js";
@@ -31,7 +32,7 @@ const CAP_FEEDS = [
   })),
 ];
 
-/** Fallback centers for state-level alerts */
+/** Fallback centers for state-level alerts (lon, lat) */
 const STATE_CENTERS = {
   FL: [-81.5158, 27.6648], TX: [-99.9018, 31.9686], CA: [-119.4179, 36.7783],
   NY: [-75.4999, 43.0003], NC: [-79.0193, 35.7596], VA: [-78.6569, 37.4316],
@@ -50,8 +51,48 @@ const STATE_CENTERS = {
   NM: [-105.8701, 34.5199], WY: [-107.2903, 43.0759], ID: [-114.742, 44.0682],
   UT: [-111.0937, 39.32], AK: [-152.4044, 64.2008], HI: [-155.5828, 19.8968],
   PR: [-66.5901, 18.2208], GU: [144.7937, 13.4443], VI: [-64.8963, 18.3358],
-  US: [-98.5795, 39.8283],
+  DC: [-77.0369, 38.9072],
 };
+
+const STATE_NAME_TO_ABBR = {
+  Alabama:"AL", Alaska:"AK", Arizona:"AZ", Arkansas:"AR", California:"CA",
+  Colorado:"CO", Connecticut:"CT", Delaware:"DE", Florida:"FL", Georgia:"GA",
+  Hawaii:"HI", Idaho:"ID", Illinois:"IL", Indiana:"IN", Iowa:"IA",
+  Kansas:"KS", Kentucky:"KY", Louisiana:"LA", Maine:"ME", Maryland:"MD",
+  Massachusetts:"MA", Michigan:"MI", Minnesota:"MN", Mississippi:"MS", Missouri:"MO",
+  Montana:"MT", Nebraska:"NE", Nevada:"NV", "New Hampshire":"NH", "New Jersey":"NJ",
+  "New Mexico":"NM", "New York":"NY", "North Carolina":"NC", "North Dakota":"ND",
+  Ohio:"OH", Oklahoma:"OK", Oregon:"OR", Pennsylvania:"PA", "Rhode Island":"RI",
+  "South Carolina":"SC", "South Dakota":"SD", Tennessee:"TN", Texas:"TX", Utah:"UT",
+  Vermont:"VT", Virginia:"VA", Washington:"WA", "West Virginia":"WV", Wisconsin:"WI",
+  Wyoming:"WY", "District of Columbia":"DC", "Puerto Rico":"PR", Guam:"GU",
+  "U.S. Virgin Islands":"VI", "US Virgin Islands":"VI", "American Samoa":"AS",
+  "Northern Mariana Islands":"MP"
+};
+
+function stateToAbbr(s) {
+  if (!s) return null;
+  const t = s.trim();
+  if (/^[A-Z]{2}$/.test(t)) return t; // already code
+  return STATE_NAME_TO_ABBR[t] || null;
+}
+
+function extractStateAbbrs(text) {
+  if (!text) return [];
+  const set = new Set();
+
+  // 2-letter codes
+  const codes = text.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/g) || [];
+  codes.forEach(c => set.add(c));
+
+  // Full names
+  for (const name of Object.keys(STATE_NAME_TO_ABBR)) {
+    const re = new RegExp(`\\b${name}\\b`, "i");
+    if (re.test(text)) set.add(STATE_NAME_TO_ABBR[name]);
+  }
+
+  return Array.from(set);
+}
 
 /* ------------------- Geometry helpers ------------------- */
 
@@ -131,24 +172,26 @@ function normalizeCountyName(raw) {
 function tryCountyCenterFromAreaDesc(areaDesc) {
   if (!areaDesc) return null;
 
-  const stateInDesc = (areaDesc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/) || [])[0];
-
+  const stateHints = extractStateAbbrs(areaDesc); // may be [], [abbr], or multiple
   const regions = areaDesc.split(/[,;]+/).map(s => s.trim()).filter(Boolean);
 
   for (const r of regions) {
-    let m = r.match(/^(.+?),\s*([A-Z]{2})$/);
+    // "Smith County, TX" or "Smith, TX" or "... , Texas"
+    let m = r.match(/^(.+?),\s*([A-Za-z .]+)$/);
     if (m) {
       const county = normalizeCountyName(m[1]);
-      const st = m[2];
-      if (countyCenters[st]?.[county]) {
-        return { type: "Point", coordinates: countyCenters[st][county] };
+      const abbr = stateToAbbr(m[2]);
+      if (abbr && countyCenters[abbr]?.[county]) {
+        return { type: "Point", coordinates: countyCenters[abbr][county] };
       }
     }
 
-    if (stateInDesc && /^[A-Za-z .'-]+$/.test(r)) {
+    // County-only token AND exactly one state hint in the whole string
+    if (stateHints.length === 1 && /^[A-Za-z .'-]+$/.test(r)) {
       const countyOnly = normalizeCountyName(r);
-      if (countyCenters[stateInDesc]?.[countyOnly]) {
-        return { type: "Point", coordinates: countyCenters[stateInDesc][countyOnly] };
+      const abbr = stateHints[0];
+      if (countyCenters[abbr]?.[countyOnly]) {
+        return { type: "Point", coordinates: countyCenters[abbr][countyOnly] };
       }
     }
   }
@@ -209,19 +252,21 @@ function normalizeCapAlert(entry,source){
       }
     }
 
-    // --- Fallback to state center (2-letter code only) ---
+    // --- Fallback to state center (supports codes + full names) ---
     if(!geometry){
-      const desc=area?.areaDesc||root?.areaDesc||"";
-      const stateMatch=desc.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/);
-      const state=stateMatch?.[1];
-      if (state && STATE_CENTERS[state]) {
-        geometry={type:"Point",coordinates:STATE_CENTERS[state]};
-        geometryMethod="state-center";
-        console.log(`🗺️ Fallback to state center: ${state} (${area.areaDesc})`);
+      const desc = area?.areaDesc || root?.areaDesc || "";
+      const stateList = extractStateAbbrs(desc);
+      if (stateList.length > 0) {
+        const abbr = stateList[0]; // first mention
+        if (STATE_CENTERS[abbr]) {
+          geometry = { type: "Point", coordinates: STATE_CENTERS[abbr] };
+          geometryMethod = "state-center";
+          console.log(`🗺️ Fallback to state center: ${abbr} (${area.areaDesc})`);
+        }
       }
     }
 
-    // --- Skip if still no valid geometry (no polygon/point/latlon/county/state) ---
+    // --- Skip if still no valid geometry ---
     if (!geometry) {
       console.warn(`🚫 Skipping alert with no geo/county/state: ${area.areaDesc || "(no areaDesc)"}`);
       return null;
@@ -329,7 +374,7 @@ function normalizeCapAlert(entry,source){
       geometry,
       geometryMethod,
       bbox,
-      hasGeometry:true,
+      hasGeometry:true, // we skip when false
       title:headlineText.trim(),
       summary:descriptionText.trim(),
       source,
