@@ -183,21 +183,42 @@ function normalizeCapAlert(entry,source){
     }
 
     // --- Human readable event / title ---
-    const eventName=info?.event||root?.event||(root.title&&root.title.split(" issued")[0])||(root.summary&&root.summary.split(" issued")[0])||"Alert";
-    const headlineText=info?.headline||root?.title||root?.summary||eventName;
+    let eventName =
+      info?.event ||
+      root?.event ||
+      (root.title && root.title.split(" issued")[0]) ||
+      (root.summary && root.summary.split(" issued")[0]) ||
+      "Alert";
 
-    const descriptionText=typeof info?.description==="string"?info.description:info?.description?.["#text"]||root?.summary||"";
-    const instructionText=info?.instruction||(typeof root?.instruction==="string"?root.instruction:"");
+    // If this is a USGS GeoRSS feed, label as Earthquake when event is generic
+    if (source === "USGS" && eventName === "Alert") {
+      eventName = "Earthquake";
+    }
 
-    const infoBlock={
-      category:info?.category||"General",
-      event:eventName.trim(),
-      urgency:info?.urgency||"Unknown",
-      severity:info?.severity||"Unknown",
-      certainty:info?.certainty||"Unknown",
-      headline:headlineText.trim(),
-      description:descriptionText.trim(),
-      instruction:instructionText.trim(),
+    const headlineText =
+      info?.headline ||
+      root?.title ||
+      root?.summary ||
+      eventName;
+
+    const descriptionText =
+      typeof info?.description === "string"
+        ? info.description
+        : info?.description?.["#text"] || root?.summary || "";
+
+    const instructionText =
+      info?.instruction ||
+      (typeof root?.instruction === "string" ? root.instruction : "");
+
+    const infoBlock = {
+      category: info?.category || "General",
+      event: eventName.trim(),
+      urgency: info?.urgency || "Unknown",
+      severity: info?.severity || "Unknown",
+      certainty: info?.certainty || "Unknown",
+      headline: headlineText.trim(),
+      description: descriptionText.trim(),
+      instruction: instructionText.trim(),
     };
 
     return{
