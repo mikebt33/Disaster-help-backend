@@ -229,26 +229,71 @@ function extractLocation(textRaw) {
     }
   }
 
-  // 5) Basin-aware coastal heuristic (very conservative)
-  const mentionsHurricane = /(hurricane|tropical storm|storm surge)/i.test(text);
+ // 5) Basin-aware coastal heuristic (very conservative)
+ const mentionsHurricane = /(hurricane|tropical storm|storm surge)/i.test(text);
 
-  if (mentionsHurricane && GULF_HINT.test(text)) {
-    // Gulf preference: choose mentioned coastal state or default to TX
-    const picked = pickFromMentioned(text, GULF_STATES) || "TX";
-    if (STATE_CENTROIDS[picked]) {
-      if (DEBUG) console.log(`🌊 Gulf context → ${picked}`);
-      return { type: "Point", coordinates: jitter(STATE_CENTROIDS[picked], 0.2), method: "coastal-heuristic", state: picked, confidence: 2 };
-    }
-  }
+ if (mentionsHurricane && GULF_HINT.test(text)) {
+   // Gulf preference: choose mentioned coastal state or default to TX
+   const picked = pickFromMentioned(text, GULF_STATES) || "TX";
+   if (STATE_CENTROIDS[picked]) {
+     if (DEBUG) console.log(`🌊 Gulf context → ${picked}`);
+     return {
+       type: "Point",
+       coordinates: jitter(STATE_CENTROIDS[picked], 0.2),
+       method: "coastal-heuristic",
+       state: picked,
+       confidence: 2
+     };
+   }
+ }
 
-  if (mentionsHurricane && ATLANTIC_HINT.test(text)) {
-    // Atlantic preference: choose mentioned coastal state or default to FL
-    const picked = pickFromMentioned(text, ATLANTIC_STATES) || "FL";
-    if (STATE_CENTROIDS[picked]) {
-      if (DEBUG) console.log(`🌀 Atlantic context → ${picked}`);
-      return { type: "Point", coordinates: jitter(STATE_CENTROIDS[picked], 0.2), method: "coastal-heuristic", state: picked, confidence: 2 };
-    }
-  }
+ if (mentionsHurricane && ATLANTIC_HINT.test(text)) {
+   // Atlantic preference: choose mentioned coastal state or default to FL
+   const picked = pickFromMentioned(text, ATLANTIC_STATES) || "FL";
+   if (STATE_CENTROIDS[picked]) {
+     if (DEBUG) console.log(`🌀 Atlantic context → ${picked}`);
+     return {
+       type: "Point",
+       coordinates: jitter(STATE_CENTROIDS[picked], 0.2),
+       method: "coastal-heuristic",
+       state: picked,
+       confidence: 2
+     };
+   }
+ }
+
+ // 5b) Florida east/west coast bias refinement
+ if (/florida\b/i.test(text)) {
+   if (/(atlantic|east coast|miami|daytona|jacksonville|melbourne)/i.test(text)) {
+     if (DEBUG) console.log("🌊 Florida east-coast bias");
+     return {
+       type: "Point",
+       coordinates: [-80.5, 27.5], // East coast
+       method: "state-coastal-bias",
+       state: "FL",
+       confidence: 2
+     };
+   } else if (/(gulf|panhandle|tampa|pensacola|fort myers|naples)/i.test(text)) {
+     if (DEBUG) console.log("🌊 Florida west-coast bias");
+     return {
+       type: "Point",
+       coordinates: [-83.0, 27.5], // West coast
+       method: "state-coastal-bias",
+       state: "FL",
+       confidence: 2
+     };
+   } else {
+     if (DEBUG) console.log("🗺️ Florida default center fallback");
+     return {
+       type: "Point",
+       coordinates: STATE_CENTROIDS.FL,
+       method: "state-center",
+       state: "FL",
+       confidence: 1
+     };
+   }
+ }
+
 
   // 6) Plain state inference near hazards
   for (const m of hazardMatches) {
