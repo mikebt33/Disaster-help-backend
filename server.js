@@ -17,6 +17,7 @@ import socialRoutes from "./src/routes/socialSignals.js";
 import userRoutes from "./src/routes/user.js";
 import followRouter from "./src/routes/follow.js";
 import "./src/services/notifications.js";
+import "dotenv/config";
 
 dotenv.config();
 

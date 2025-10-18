@@ -3,6 +3,7 @@ import { getDB } from "../db.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import "dotenv/config";
 
 // --- Geo helpers ------------------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
