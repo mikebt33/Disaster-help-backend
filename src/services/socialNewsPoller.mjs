@@ -248,8 +248,22 @@ function extractLocation(textRaw) {
  }
 
  if (mentionsHurricane && ATLANTIC_HINT.test(text)) {
-   // Atlantic preference: choose mentioned coastal state or default to FL
+   // Atlantic preference: choose mentioned coastal state or default to FL (East Coast bias)
    const picked = pickFromMentioned(text, ATLANTIC_STATES) || "FL";
+
+   // Florida east-coast bias for Atlantic storms
+   if (picked === "FL") {
+     if (DEBUG) console.log("🌊 Atlantic storm mentioning Florida → east coast bias");
+     return {
+       type: "Point",
+       coordinates: [-80.5, 27.5], // Atlantic side of FL
+       method: "state-coastal-bias",
+       state: "FL",
+       confidence: 3
+     };
+   }
+
+   // All other Atlantic states
    if (STATE_CENTROIDS[picked]) {
      if (DEBUG) console.log(`🌀 Atlantic context → ${picked}`);
      return {
