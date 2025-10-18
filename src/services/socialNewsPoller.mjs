@@ -36,48 +36,62 @@ function tryLocationFromText(text) {
   if (!text) return null;
   const lower = text.toLowerCase();
 
-  // --- 1️⃣ Detect explicit state name or abbreviation -----------------------
-  const stateMatch = lower.match(
-    /\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming)\b|(\bAL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b/g
-  );
+  // Full state name to abbreviation map
+  const STATE_ABBR = {
+    alabama: "AL", alaska: "AK", arizona: "AZ", arkansas: "AR", california: "CA",
+    colorado: "CO", connecticut: "CT", delaware: "DE", florida: "FL", georgia: "GA",
+    hawaii: "HI", idaho: "ID", illinois: "IL", indiana: "IN", iowa: "IA", kansas: "KS",
+    kentucky: "KY", louisiana: "LA", maine: "ME", maryland: "MD", massachusetts: "MA",
+    michigan: "MI", minnesota: "MN", mississippi: "MS", missouri: "MO", montana: "MT",
+    nebraska: "NE", nevada: "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC", "north dakota": "ND",
+    ohio: "OH", oklahoma: "OK", oregon: "OR", pennsylvania: "PA", "rhode island": "RI",
+    "south carolina": "SC", "south dakota": "SD", tennessee: "TN", texas: "TX",
+    utah: "UT", vermont: "VT", virginia: "VA", washington: "WA", "west virginia": "WV",
+    wisconsin: "WI", wyoming: "WY"
+  };
 
-  let matchedState = null;
-  if (stateMatch && stateMatch[0]) {
-    matchedState = stateMatch[0]
-      .toUpperCase()
-      .replace(/[^A-Z]/g, "")
-      .slice(0, 2);
-  }
-
-  // --- 2️⃣ If a state is found, check for a county inside that same state ----
-  if (matchedState && countyCenters[matchedState]) {
-    const counties = countyCenters[matchedState];
+  // 1️⃣ County-level match
+  for (const [stateCode, counties] of Object.entries(countyCenters)) {
     for (const [countyName, coords] of Object.entries(counties)) {
       if (Array.isArray(coords) && lower.includes(countyName.toLowerCase())) {
         return {
           type: "Point",
-          coordinates: coords,
+          coordinates: applyJitter(coords),
           method: "county",
-          state: matchedState
+          state: stateCode
         };
       }
     }
-
-    // No county match; fall back to state centroid
-    const coordsArray = Object.values(counties).filter(Array.isArray);
-    const avgLon = coordsArray.reduce((sum, c) => sum + c[0], 0) / coordsArray.length;
-    const avgLat = coordsArray.reduce((sum, c) => sum + c[1], 0) / coordsArray.length;
-
-    return {
-      type: "Point",
-      coordinates: [avgLon, avgLat],
-      method: "state",
-      state: matchedState
-    };
   }
 
-  // --- 3️⃣ If no state, skip entirely ---------------------------------------
+  // 2️⃣ State-level match
+  const stateMatch = Object.keys(STATE_ABBR).find(name => lower.includes(name));
+  if (stateMatch) {
+    const abbr = STATE_ABBR[stateMatch];
+    const counties = countyCenters[abbr];
+    if (counties && Object.keys(counties).length) {
+      const coordsArray = Object.values(counties).filter(Array.isArray);
+      const avgLon = coordsArray.reduce((sum, c) => sum + c[0], 0) / coordsArray.length;
+      const avgLat = coordsArray.reduce((sum, c) => sum + c[1], 0) / coordsArray.length;
+      return {
+        type: "Point",
+        coordinates: applyJitter([avgLon, avgLat]),
+        method: "state",
+        state: abbr
+      };
+    }
+  }
+
   return null;
+}
+
+// Add random jitter to avoid identical stacking
+function applyJitter([lon, lat]) {
+  const jitter = 0.25; // about ~20–25 km
+  const lonOffset = (Math.random() - 0.5) * jitter;
+  const latOffset = (Math.random() - 0.5) * jitter;
+  return [lon + lonOffset, lat + latOffset];
 }
 
 // --- Normalize and filter article ------------------------------------------
