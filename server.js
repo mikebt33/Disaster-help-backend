@@ -7,10 +7,13 @@ import cron from "node-cron";
 import { connectDB, getDB } from "./src/db.js";
 import { runCleanup } from "./src/services/cleanupService.js";
 import { pollCapFeeds } from "./src/services/capPoller.mjs";
+import { pollNewsAPI } from "./src/services/socialNewsPoller.mjs";
+import { ensureIndexes } from "./src/db/indexes.mjs";
 import helpRoutes from "./src/routes/helpRequests.js";
 import offerRoutes from "./src/routes/offers.js";
 import hazardRoutes from "./src/routes/hazards.js";
 import alertRoutes from "./src/routes/alertsCap.js";
+import socialRoutes from "./src/routes/socialSignals.js";
 import userRoutes from "./src/routes/user.js";
 import followRouter from "./src/routes/follow.js";
 import "./src/services/notifications.js";
@@ -130,6 +133,9 @@ try {
   console.warn("⚠️ hazards schema validation skipped or failed:", e.message);
 }
 
+// ✅ Add indexes for the new social/news layer
+await ensureIndexes();
+console.log("✅ Social/news indexes ensured");
 
 // Optional: remove CAP alerts older than 7 days
 await db.collection("alerts_cap").deleteMany({
@@ -143,6 +149,7 @@ app.use("/api/help-requests", helpRoutes);
 app.use("/api/offers", offerRoutes);
 app.use("/api/hazards", hazardRoutes);
 app.use("/api/alerts-cap", alertRoutes);
+app.use("/api/social-signals", socialRoutes);
 app.use("/api/user", userRoutes);
 app.use("/api", followRouter); // keep last
 
@@ -180,10 +187,17 @@ cron.schedule("*/5 * * * *", async () => {
   await pollCapFeeds();
 });
 
+// 📰 News poller — initial + every 15 minutes
+console.log("📰 Initial NewsAPI poll on startup...");
+await pollNewsAPI();
+
+cron.schedule("*/15 * * * *", async () => {
+  console.log("📰 Scheduled NewsAPI polling running...");
+  await pollNewsAPI();
+});
+
 // ---------------------------------------------------------------------------
 // 🚀 Start Server
 // ---------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () =>
-  console.log(`🚀 Server running on port ${PORT}`)
-);
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
