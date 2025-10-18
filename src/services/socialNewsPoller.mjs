@@ -1,6 +1,6 @@
 // news/socialNewsPoller.mjs (or .js)
 // Strict U.S.-only disaster poller with high-precision state mapping.
-// Fixes global-RegExp 'lastIndex' bug and adds conservative AK/HI + coastal heuristics.
+// Adds Atlantic vs Gulf coastal split, AK/HI handling, safe regex rebuilds, and tiny jitter.
 
 import axios from "axios";
 import { getDB } from "../db.js";
@@ -58,14 +58,13 @@ const HAZARD_WORDS = [
   "tsunami", "volcano", "eruption", "landslide", "mudslide", "blizzard",
   "heat wave", "heatwave", "drought", "avalanche", "hailstorm", "dust storm",
   "severe weather", "snowstorm", "ice storm", "power outage", "blackout",
-  "floods", "flooding" // prefer plural/gerund over bare "flood"
+  "floods", "flooding"
 ];
 
 // Build a safe source string and factory to avoid global RegExp state bugs
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const HAZARD_RE_SOURCE =
   "\\b(" + HAZARD_WORDS.sort((a, b) => b.length - a.length).map(esc).join("|") + ")\\b";
-// Create a new RegExp per call to avoid lastIndex side-effects
 const makeHazardRe = (flags) => new RegExp(HAZARD_RE_SOURCE, flags);
 
 // Noise / non-disaster topics (explicit)
@@ -119,6 +118,29 @@ function toStateCode(token) {
 const makeStateAbbrRe = () => new RegExp("\\b(" + Array.from(STATE_CODES).join("|") + ")\\b", "g");
 const makeStateFullRe = () => new RegExp("\\b(" + Array.from(STATE_NAMES).join("|") + ")\\b", "gi");
 
+// -------------------- Coastal heuristic helpers --------------------
+const ATLANTIC_HINT = /(atlantic|outer banks|mid-atlantic|east coast|bermuda|bahamas)/i;
+const GULF_HINT = /\bgulf\b|\bgulf of mexico\b|\bpanhandle\b|\byucat[aá]n\b/i;
+
+const ATLANTIC_STATES = ["FL","GA","SC","NC","VA","MD","DE","NJ","NY","CT","RI","MA","ME"];
+const GULF_STATES = ["TX","LA","MS","AL","FL"];
+
+function pickFromMentioned(text, candidateStates) {
+  const abbrRe = makeStateAbbrRe();
+  const fullRe = makeStateFullRe();
+  const tokens = [
+    ...text.matchAll(abbrRe),
+    ...text.matchAll(fullRe),
+  ].map((m) => toStateCode(m[0]) || "");
+
+  const score = {};
+  for (const t of tokens) {
+    if (candidateStates.includes(t)) score[t] = (score[t] || 0) + 1;
+  }
+  const best = Object.entries(score).sort((a, b) => b[1] - a[1])[0];
+  return best ? best[0] : null;
+}
+
 // -------------------- Location extraction (conservative) --------------------
 /**
  * Extract a US state (and optionally a county within that state) from text,
@@ -156,9 +178,11 @@ function extractLocation(textRaw) {
 
   // 2) Conservative AK/HI explicit mapping
   if (/\balaska\b/.test(text) && STATE_CENTROIDS.AK) {
+    if (DEBUG) console.log("🧭 Alaska explicit → AK");
     return { type: "Point", coordinates: jitter(STATE_CENTROIDS.AK, 0.1), method: "state", state: "AK", confidence: 3 };
   }
   if (/\bhawaii\b/.test(text) && STATE_CENTROIDS.HI) {
+    if (DEBUG) console.log("🧭 Hawaii explicit → HI");
     return { type: "Point", coordinates: jitter(STATE_CENTROIDS.HI, 0.1), method: "state", state: "HI", confidence: 3 };
   }
 
@@ -176,6 +200,7 @@ function extractLocation(textRaw) {
       if (stCode && countyCenters[stCode] && countyCenters[stCode][countyName]) {
         const coords = countyCenters[stCode][countyName];
         if (Array.isArray(coords) && inUSBounds(coords[0], coords[1])) {
+          if (DEBUG) console.log(`📍 County match → ${countyName}, ${stCode}`);
           return { type: "Point", coordinates: jitter(coords, 0.08), method: "county", state: stCode, confidence: 3 };
         }
       }
@@ -198,36 +223,30 @@ function extractLocation(textRaw) {
 
       const stCode = toStateCode(token);
       if (stCode && STATE_CENTROIDS[stCode]) {
+        if (DEBUG) console.log(`🧭 Dateline → ${stCode}`);
         return { type: "Point", coordinates: jitter(STATE_CENTROIDS[stCode], 0.15), method: "state", state: stCode, confidence: 2 };
       }
     }
   }
 
-  // 5) Atlantic hurricane coastal heuristic (very conservative)
-  // Only if hurricane/tropical storm mentioned and Atlantic/Caribbean context exists
-  const lower = text;
-  const hurricaneContext =
-    /(hurricane|tropical storm|storm surge)/i.test(lower) &&
-    /(atlantic|gulf of mexico|caribbean|outer banks|bermuda|bahamas)/i.test(lower);
+  // 5) Basin-aware coastal heuristic (very conservative)
+  const mentionsHurricane = /(hurricane|tropical storm|storm surge)/i.test(text);
 
-  if (hurricaneContext) {
-    // If any explicit coastal state is also mentioned, use that. Else fall back to FL.
-    const coastalCandidates = ["FL", "GA", "SC", "NC", "VA", "AL", "MS", "LA", "TX"];
-    const abbrRe = makeStateAbbrRe();
-    const fullRe = makeStateFullRe();
-    const tokens = [
-      ...lower.matchAll(abbrRe),
-      ...lower.matchAll(fullRe),
-    ].map((m) => toStateCode(m[0]) || "");
-
-    const score = {};
-    for (const t of tokens) {
-      if (coastalCandidates.includes(t)) score[t] = (score[t] || 0) + 1;
+  if (mentionsHurricane && GULF_HINT.test(text)) {
+    // Gulf preference: choose mentioned coastal state or default to TX
+    const picked = pickFromMentioned(text, GULF_STATES) || "TX";
+    if (STATE_CENTROIDS[picked]) {
+      if (DEBUG) console.log(`🌊 Gulf context → ${picked}`);
+      return { type: "Point", coordinates: jitter(STATE_CENTROIDS[picked], 0.2), method: "coastal-heuristic", state: picked, confidence: 2 };
     }
-    const best = Object.entries(score).sort((a, b) => b[1] - a[1])[0];
-    const chosen = best ? best[0] : "FL";
-    if (STATE_CENTROIDS[chosen]) {
-      return { type: "Point", coordinates: jitter(STATE_CENTROIDS[chosen], 0.2), method: "coastal-heuristic", state: chosen, confidence: 2 };
+  }
+
+  if (mentionsHurricane && ATLANTIC_HINT.test(text)) {
+    // Atlantic preference: choose mentioned coastal state or default to FL
+    const picked = pickFromMentioned(text, ATLANTIC_STATES) || "FL";
+    if (STATE_CENTROIDS[picked]) {
+      if (DEBUG) console.log(`🌀 Atlantic context → ${picked}`);
+      return { type: "Point", coordinates: jitter(STATE_CENTROIDS[picked], 0.2), method: "coastal-heuristic", state: picked, confidence: 2 };
     }
   }
 
@@ -244,7 +263,6 @@ function extractLocation(textRaw) {
       ...window.matchAll(fullRe),
     ].map((mm) => mm[0]);
 
-    // Reduce tokens to the strongest single state
     const counts = {};
     for (const tok of simpleStateTokens) {
       if (/^washington$/i.test(tok) && !WASHINGTON_STRICT.test(window)) continue;
@@ -254,6 +272,7 @@ function extractLocation(textRaw) {
     }
     const candidate = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
     if (candidate && STATE_CENTROIDS[candidate[0]]) {
+      if (DEBUG) console.log(`📍 Simple state → ${candidate[0]}`);
       return { type: "Point", coordinates: jitter(STATE_CENTROIDS[candidate[0]], 0.15), method: "state", state: candidate[0], confidence: 2 };
     }
   }
@@ -320,6 +339,7 @@ async function saveNewsArticles(articles) {
     await col.deleteMany({ expires: { $lte: new Date() } });
 
     for (const a of articles) {
+      // Upsert by URL; ignore if missing URL
       if (!a.url) continue;
       await col.updateOne({ url: a.url }, { $set: a }, { upsert: true });
     }
@@ -353,6 +373,7 @@ export async function pollNewsAPI() {
       return;
     }
 
+    // Normalize and keep only high-confidence results
     const normalized = data.articles
       .map(normalizeArticle)
       .filter(Boolean)
