@@ -1,5 +1,6 @@
 // news/socialNewsPoller.mjs (or .js)
 // Strict U.S.-only disaster poller with high-precision state mapping.
+// Fixes global-RegExp 'lastIndex' bug and adds conservative AK/HI + coastal heuristics.
 
 import axios from "axios";
 import { getDB } from "../db.js";
@@ -9,6 +10,7 @@ import { fileURLToPath } from "url";
 import "dotenv/config";
 
 console.log("NEWS_API_KEY loaded:", !!process.env.NEWS_API_KEY);
+const DEBUG = !!process.env.DEBUG_NEWS_GEO;
 
 // -------------------- Load county centers --------------------
 const __filename = fileURLToPath(import.meta.url);
@@ -56,18 +58,15 @@ const HAZARD_WORDS = [
   "tsunami", "volcano", "eruption", "landslide", "mudslide", "blizzard",
   "heat wave", "heatwave", "drought", "avalanche", "hailstorm", "dust storm",
   "severe weather", "snowstorm", "ice storm", "power outage", "blackout",
-  "floods", "flooding" // plural/gerund preferred over bare "flood"
+  "floods", "flooding" // prefer plural/gerund over bare "flood"
 ];
-// Build strict regex for hazards (order matters: longer phrases first)
-const HAZARD_REGEX = new RegExp(
-  "\\b(" +
-    HAZARD_WORDS
-      .sort((a, b) => b.length - a.length)
-      .map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-      .join("|") +
-  ")\\b",
-  "gi"
-);
+
+// Build a safe source string and factory to avoid global RegExp state bugs
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const HAZARD_RE_SOURCE =
+  "\\b(" + HAZARD_WORDS.sort((a, b) => b.length - a.length).map(esc).join("|") + ")\\b";
+// Create a new RegExp per call to avoid lastIndex side-effects
+const makeHazardRe = (flags) => new RegExp(HAZARD_RE_SOURCE, flags);
 
 // Noise / non-disaster topics (explicit)
 const HARD_BLOCK = /(\b(taylor swift|grammy|oscars?|hollywood|netflix|museum|painting|concert|celebrity|theater|movie|album|music video)\b)|(\b(senate|congress|election|campaign|supreme court|lawsuit|indictment|democrat|republican|white house|trump|biden)\b)|(\b(stock|market|loan|bailout|stimulus|bond|treasury|fiscal|budget)\b)|(\b(shooting|murder|assault|homicide|kidnapping|smuggler|cartel)\b)/i;
@@ -86,7 +85,6 @@ const WEAK_ALONE = /\b(rescue|rescues|rescued|evacuation|evacuations|evacuate|ev
 
 // Washington special cases (avoid DC/post)
 const WASHINGTON_FALSE = /\b(washington post|washington,\s*d\.?c\.?|washington dc)\b/i;
-
 // Accept “Washington state”, “western/eastern Washington”, etc.
 const WASHINGTON_STRICT = /\b(washington state|western washington|eastern washington|state of washington)\b/i;
 
@@ -101,10 +99,13 @@ function inUSBounds(lon, lat) {
   return conus || alaska || hawaii;
 }
 
-// -------------------- State token helpers --------------------
-const STATE_ABBR_RE = new RegExp("\\b(" + Array.from(STATE_CODES).join("|") + ")\\b", "g");
-const STATE_FULL_RE = new RegExp("\\b(" + Array.from(STATE_NAMES).join("|") + ")\\b", "gi");
+// Optional tiny jitter to avoid exact pin stacking (kept conservative)
+function jitter(coords, deg = 0.15) {
+  const [lon, lat] = coords;
+  return [lon + (Math.random() - 0.5) * deg, lat + (Math.random() - 0.5) * deg];
+}
 
+// -------------------- State token helpers --------------------
 function toStateCode(token) {
   if (!token) return null;
   const t = token.trim();
@@ -113,6 +114,10 @@ function toStateCode(token) {
   if (STATE_NAME_TO_CODE[n]) return STATE_NAME_TO_CODE[n];
   return null;
 }
+
+// Build state regexes per call (avoid global lastIndex issues)
+const makeStateAbbrRe = () => new RegExp("\\b(" + Array.from(STATE_CODES).join("|") + ")\\b", "g");
+const makeStateFullRe = () => new RegExp("\\b(" + Array.from(STATE_NAMES).join("|") + ")\\b", "gi");
 
 // -------------------- Location extraction (conservative) --------------------
 /**
@@ -124,11 +129,14 @@ function extractLocation(textRaw) {
   const text = textRaw.toLowerCase();
 
   // 1) Must contain a real hazard term
-  const hazardMatches = [...text.matchAll(HAZARD_REGEX)];
+  const hazardMatches = [...text.matchAll(makeHazardRe("gi"))];
   if (hazardMatches.length === 0) return null;
 
   // Reject hard noise, foreign contexts, figurative uses
-  if (HARD_BLOCK.test(text) || FOREIGN.test(text) || FIGURATIVE.test(text)) return null;
+  if (HARD_BLOCK.test(text) || FOREIGN.test(text) || FIGURATIVE.test(text)) {
+    if (DEBUG) console.log("🧹 Drop by block/foreign/figurative");
+    return null;
+  }
 
   // Require validating weather/emergency context near at least one hazard
   let hasValidatedHazard = false;
@@ -141,18 +149,26 @@ function extractLocation(textRaw) {
       break;
     }
   }
-  if (!hasValidatedHazard) return null;
+  if (!hasValidatedHazard) {
+    if (DEBUG) console.log("🧹 Drop: hazard lacks validating context");
+    return null;
+  }
 
-  // 2) Search near hazards for explicit "County, ST/State" then "ST/State" tokens
-  // Only accept county if paired with an explicit state in the same window.
-  let best = null; // { state, coords, method, confidence }
+  // 2) Conservative AK/HI explicit mapping
+  if (/\balaska\b/.test(text) && STATE_CENTROIDS.AK) {
+    return { type: "Point", coordinates: jitter(STATE_CENTROIDS.AK, 0.1), method: "state", state: "AK", confidence: 3 };
+  }
+  if (/\bhawaii\b/.test(text) && STATE_CENTROIDS.HI) {
+    return { type: "Point", coordinates: jitter(STATE_CENTROIDS.HI, 0.1), method: "state", state: "HI", confidence: 3 };
+  }
+
+  // 3) County, ST or County, StateName (only when explicitly paired)
+  const countyRe = /([A-Za-z.\- ']+?)\s+county(?:\s+[\w'.-]+)?\s*,\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|[A-Za-z ]{4,})\b/gi;
   for (const m of hazardMatches) {
     const start = Math.max(0, m.index - 140);
     const end = Math.min(text.length, m.index + m[0].length + 140);
     const window = text.slice(start, end);
 
-    // (a) County, ST or County, StateName
-    const countyRe = /([A-Za-z.\- ']+?)\s+county(?:\s+[\w'.-]+)?\s*,\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|[A-Za-z ]{4,})\b/gi;
     let cm;
     while ((cm = countyRe.exec(window))) {
       const countyName = cm[1].trim().replace(/\s+Sheriff.*$/i, "");
@@ -160,40 +176,77 @@ function extractLocation(textRaw) {
       if (stCode && countyCenters[stCode] && countyCenters[stCode][countyName]) {
         const coords = countyCenters[stCode][countyName];
         if (Array.isArray(coords) && inUSBounds(coords[0], coords[1])) {
-          best = { state: stCode, coords, method: "county", confidence: 3 };
-          break;
+          return { type: "Point", coordinates: jitter(coords, 0.08), method: "county", state: stCode, confidence: 3 };
         }
       }
     }
-    if (best) break;
+  }
 
-    // (b) City/Place, ST|State — style datelines; we only keep the state
+  // 4) City/Place, ST|State — style datelines (keep the state only)
+  for (const m of hazardMatches) {
+    const start = Math.max(0, m.index - 140);
+    const end = Math.min(text.length, m.index + m[0].length + 140);
+    const window = text.slice(start, end);
     const datelineRe = /[,–—-]\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|[A-Za-z ]{4,})\b/gi;
+
     let d;
     while ((d = datelineRe.exec(window))) {
       let token = d[1].trim();
-      // Washington special handling: ignore DC/Post; accept only explicit "Washington state"
+      // Washington special handling
       if (/^washington$/i.test(token) && !WASHINGTON_STRICT.test(window)) continue;
       if (WASHINGTON_FALSE.test(window)) continue;
 
       const stCode = toStateCode(token);
       if (stCode && STATE_CENTROIDS[stCode]) {
-        best = { state: stCode, coords: STATE_CENTROIDS[stCode], method: "state", confidence: 2 };
-        break;
+        return { type: "Point", coordinates: jitter(STATE_CENTROIDS[stCode], 0.15), method: "state", state: stCode, confidence: 2 };
       }
     }
-    if (best) break;
+  }
 
-    // (c) Plain "in <State>" / "<State> coast" etc.
+  // 5) Atlantic hurricane coastal heuristic (very conservative)
+  // Only if hurricane/tropical storm mentioned and Atlantic/Caribbean context exists
+  const lower = text;
+  const hurricaneContext =
+    /(hurricane|tropical storm|storm surge)/i.test(lower) &&
+    /(atlantic|gulf of mexico|caribbean|outer banks|bermuda|bahamas)/i.test(lower);
+
+  if (hurricaneContext) {
+    // If any explicit coastal state is also mentioned, use that. Else fall back to FL.
+    const coastalCandidates = ["FL", "GA", "SC", "NC", "VA", "AL", "MS", "LA", "TX"];
+    const abbrRe = makeStateAbbrRe();
+    const fullRe = makeStateFullRe();
+    const tokens = [
+      ...lower.matchAll(abbrRe),
+      ...lower.matchAll(fullRe),
+    ].map((m) => toStateCode(m[0]) || "");
+
+    const score = {};
+    for (const t of tokens) {
+      if (coastalCandidates.includes(t)) score[t] = (score[t] || 0) + 1;
+    }
+    const best = Object.entries(score).sort((a, b) => b[1] - a[1])[0];
+    const chosen = best ? best[0] : "FL";
+    if (STATE_CENTROIDS[chosen]) {
+      return { type: "Point", coordinates: jitter(STATE_CENTROIDS[chosen], 0.2), method: "coastal-heuristic", state: chosen, confidence: 2 };
+    }
+  }
+
+  // 6) Plain state inference near hazards
+  for (const m of hazardMatches) {
+    const start = Math.max(0, m.index - 140);
+    const end = Math.min(text.length, m.index + m[0].length + 140);
+    const window = text.slice(start, end);
+    const abbrRe = makeStateAbbrRe();
+    const fullRe = makeStateFullRe();
+
     const simpleStateTokens = [
-      ...window.matchAll(STATE_ABBR_RE),
-      ...window.matchAll(STATE_FULL_RE),
+      ...window.matchAll(abbrRe),
+      ...window.matchAll(fullRe),
     ].map((mm) => mm[0]);
 
     // Reduce tokens to the strongest single state
     const counts = {};
     for (const tok of simpleStateTokens) {
-      // Exclude bare "washington"
       if (/^washington$/i.test(tok) && !WASHINGTON_STRICT.test(window)) continue;
       const stCode = toStateCode(tok);
       if (!stCode) continue;
@@ -201,22 +254,12 @@ function extractLocation(textRaw) {
     }
     const candidate = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
     if (candidate && STATE_CENTROIDS[candidate[0]]) {
-      best = { state: candidate[0], coords: STATE_CENTROIDS[candidate[0]], method: "state", confidence: 2 };
-      break;
+      return { type: "Point", coordinates: jitter(STATE_CENTROIDS[candidate[0]], 0.15), method: "state", state: candidate[0], confidence: 2 };
     }
   }
 
-  if (!best) return null;
-
-  // Sanity check bounds
-  if (!best.coords || !inUSBounds(best.coords[0], best.coords[1])) return null;
-  return {
-    type: "Point",
-    coordinates: best.coords,
-    method: best.method,
-    state: best.state,
-    confidence: best.confidence
-  };
+  if (DEBUG) console.log("🧹 Drop: no reliable US location");
+  return null;
 }
 
 // -------------------- Normalize & filter an article --------------------
@@ -227,17 +270,23 @@ function normalizeArticle(article) {
     const content = (article.content || "").trim();
     const text = `${title}\n${desc}\n${content}`;
 
-    // Filter obvious non-disaster topics/contexts early
-    if (HARD_BLOCK.test(text) || FOREIGN.test(text) || FIGURATIVE.test(text)) return null;
+    if (HARD_BLOCK.test(text) || FOREIGN.test(text) || FIGURATIVE.test(text)) {
+      if (DEBUG) console.log("🧹 Drop early (block/foreign/figurative):", title);
+      return null;
+    }
 
-    // Require at least one *strict* hazard token
-    if (!HAZARD_REGEX.test(text)) return null;
+    // Use a *fresh* regex (no /g state bug)
+    if (!makeHazardRe("i").test(text)) {
+      if (DEBUG) console.log("🧹 Drop: no strict hazard:", title);
+      return null;
+    }
 
-    // Extract precise US location near hazards
     const geometry = extractLocation(text);
-    if (!geometry) return null;
+    if (!geometry) {
+      if (DEBUG) console.log("🧹 Drop: no geometry:", title);
+      return null;
+    }
 
-    // Pull domain
     let domain = "";
     try {
       const u = new URL(article.url);
@@ -271,7 +320,6 @@ async function saveNewsArticles(articles) {
     await col.deleteMany({ expires: { $lte: new Date() } });
 
     for (const a of articles) {
-      // Upsert by URL; ignore if missing URL
       if (!a.url) continue;
       await col.updateOne({ url: a.url }, { $set: a }, { upsert: true });
     }
@@ -305,18 +353,17 @@ export async function pollNewsAPI() {
       return;
     }
 
-    // Normalize and keep only high-confidence results
     const normalized = data.articles
       .map(normalizeArticle)
       .filter(Boolean)
-      .filter(a => (a.geometry?.confidence ?? 0) >= 2); // only state-confirmed or county+state
+      .filter((a) => (a.geometry?.confidence ?? 0) >= 2); // only state-confirmed or county+state
 
     console.log(`✅ Parsed ${normalized.length} relevant of ${data.articles.length} total`);
     if (normalized.length) {
       console.log(
         normalized
           .slice(0, 6)
-          .map(a => `🌎 ${a.title} — ${a.source} (${a.geometry.state}, ${a.geometryMethod})`)
+          .map((a) => `🌎 ${a.title} — ${a.source} (${a.geometry.state}, ${a.geometryMethod})`)
           .join("\n")
       );
       await saveNewsArticles(normalized);
