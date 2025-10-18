@@ -36,29 +36,39 @@ function tryLocationFromText(text) {
   if (!text) return null;
   const lower = text.toLowerCase();
 
-  // 1️⃣ County-level search
+  // --- 1️⃣ County-level match -------------------------------------
   for (const [stateCode, meta] of Object.entries(countyCenters)) {
     const counties = meta.counties || {};
     for (const [countyName, cData] of Object.entries(counties)) {
       if (lower.includes(countyName.toLowerCase())) {
-        return { type: "Point", coordinates: cData.center || [0, 0], method: "county" };
+        return {
+          type: "Point",
+          coordinates: cData.center || [0, 0],
+          method: "county"
+        };
       }
     }
   }
 
-  // 2️⃣ State abbreviation or full name
+  // --- 2️⃣ State-level match ---------------------------------------
   const stateMatch = lower.match(
     /\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming)\b|(\bAL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b/g
   );
+
   if (stateMatch && stateMatch[0]) {
     const foundState = stateMatch[0].toUpperCase().slice(0, 2);
-    if (countyCenters[foundState]) {
-      return { type: "Point", coordinates: countyCenters[foundState].__center || [0, 0], method: "state" };
+    if (countyCenters[foundState]?.__center) {
+      return {
+        type: "Point",
+        coordinates: countyCenters[foundState].__center,
+        method: "state"
+      };
     }
   }
 
-  // 3️⃣ Fallback to U.S. centroid
-  return { type: "Point", coordinates: [-98.5795, 39.8283], method: "us-centroid" };
+  // --- 3️⃣ No match found ------------------------------------------
+  // Return null so we skip saving this article.
+  return null;
 }
 
 // --- Normalize and filter article -------------------------------------------
