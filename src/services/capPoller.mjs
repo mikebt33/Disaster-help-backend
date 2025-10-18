@@ -282,7 +282,23 @@ function normalizeCapAlert(entry,source){
     }
 
     // --- Event labeling + expiration logic (USGS short TTLs) ---
-    let expires = info?.expires || root?.expires || null;
+    // --- Normalize expiration to proper Date object ---
+    let expiresRaw = info?.expires || root?.expires || null;
+    let expires = null;
+
+    if (expiresRaw) {
+      const parsed = new Date(expiresRaw);
+      if (!isNaN(parsed.getTime())) {
+        expires = parsed;
+      } else {
+        console.warn(`⚠️ Invalid expires format, fallback 1h TTL for ${root?.identifier || "(unknown)"}`);
+        expires = new Date(Date.now() + 60 * 60 * 1000);
+      }
+    } else {
+      // Fallback if feed didn’t include expires
+      expires = new Date(Date.now() + 60 * 60 * 1000);
+    }
+
     let eventName =
       info?.event ||
       root?.event ||
