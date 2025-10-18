@@ -23,18 +23,34 @@ const CORE_HAZARDS = [
   "tornado", "cyclone", "typhoon", "wildfire", "bushfire", "forest fire",
   "earthquake", "aftershock", "tsunami", "volcano", "eruption",
   "landslide", "mudslide", "blizzard", "heatwave", "drought",
-  "avalanche", "hailstorm", "dust storm", "severe weather",
-  "snowstorm", "ice storm", "power outage", "blackout",
-  "evacuation", "evacuations", "shelter", "rescue"
+  "avalanche", "hailstorm", "dust storm", "snowstorm", "ice storm",
+  "power outage", "blackout", "evacuation", "shelter", "rescue"
 ];
 
-// 🚫 Non-disaster / foreign / political blocklist ----------------------------
-const BLOCK_TERMS = /(gaza|israel|ukraine|russia|idf|hamas|hezbollah|missile|airstrike|attack|smuggler|drug|cartel|shooting|murder|politic|election|redistrict|party|military|conflict|war|terror|crime|border patrol)/i;
+// 🚫 Non-disaster / foreign / entertainment blocklist ------------------------
+const BLOCK_TERMS =
+  /(gaza|israel|ukraine|russia|idf|hamas|hezbollah|missile|airstrike|attack|smuggler|drug|cartel|shooting|murder|politic|election|party|military|conflict|war|terror|crime|border patrol|museum|concert|celebrity|swift|movie|award|fashion|sport|soccer|baseball|nba|football|hockey|german|mexico|canada|china|japan|india|africa|europe|paris|london|berlin|madrid|moscow)/i;
 
 // --- Geo logic --------------------------------------------------------------
 function tryLocationFromText(text) {
   if (!text) return null;
   const lower = text.toLowerCase();
+
+  // Alaska special case — many alerts reference it explicitly
+  if (/\balaska\b|\banchorage\b|\bjuneau\b|\bkenai\b|\bbethel\b|\bnome\b|\bfairbanks\b|\bwasilla\b/.test(lower)) {
+    const counties = countyCenters["AK"];
+    if (counties) {
+      const coordsArray = Object.values(counties).filter(Array.isArray);
+      const avgLon = coordsArray.reduce((s, c) => s + c[0], 0) / coordsArray.length;
+      const avgLat = coordsArray.reduce((s, c) => s + c[1], 0) / coordsArray.length;
+      return {
+        type: "Point",
+        coordinates: applyJitter([avgLon, avgLat]),
+        method: "state",
+        state: "AK"
+      };
+    }
+  }
 
   // Full state name to abbreviation map
   const STATE_ABBR = {
@@ -72,8 +88,8 @@ function tryLocationFromText(text) {
     const counties = countyCenters[abbr];
     if (counties && Object.keys(counties).length) {
       const coordsArray = Object.values(counties).filter(Array.isArray);
-      const avgLon = coordsArray.reduce((sum, c) => sum + c[0], 0) / coordsArray.length;
-      const avgLat = coordsArray.reduce((sum, c) => sum + c[1], 0) / coordsArray.length;
+      const avgLon = coordsArray.reduce((s, c) => s + c[0], 0) / coordsArray.length;
+      const avgLat = coordsArray.reduce((s, c) => s + c[1], 0) / coordsArray.length;
       return {
         type: "Point",
         coordinates: applyJitter([avgLon, avgLat]),
@@ -88,7 +104,7 @@ function tryLocationFromText(text) {
 
 // Add random jitter to avoid identical stacking
 function applyJitter([lon, lat]) {
-  const jitter = 0.25; // about ~20–25 km
+  const jitter = 0.3; // ~25–30 km offset
   const lonOffset = (Math.random() - 0.5) * jitter;
   const latOffset = (Math.random() - 0.5) * jitter;
   return [lon + lonOffset, lat + latOffset];
@@ -101,10 +117,14 @@ function normalizeArticle(article) {
     const desc = (article.description || "").trim();
     const text = `${title} ${desc}`.toLowerCase();
 
-    // Skip irrelevant topics
+    // Skip irrelevant topics or foreign references
     if (BLOCK_TERMS.test(text)) return null;
 
-    // Must contain at least one core hazard
+    // Exclude figurative “flood” uses like “fans flood museum”
+    if (/fans flood|flooded with applause|sales flood|inbox flooded/.test(text))
+      return null;
+
+    // Must contain a core hazard
     const hasHazard = CORE_HAZARDS.some(k => text.includes(k));
     if (!hasHazard) return null;
 
