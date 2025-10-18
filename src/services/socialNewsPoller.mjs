@@ -17,28 +17,28 @@ const countyCenters = JSON.parse(fs.readFileSync(countyCentersPath, "utf8"));
 const NEWS_API_URL = "https://newsapi.org/v2/everything";
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
 
-// 🧭 Phase 1: Broad discovery keyword model
-const KEYWORDS = [
-  // Core hazards
+// ✅ Core U.S. hazard keywords -----------------------------------------------
+const CORE_HAZARDS = [
   "flood", "flash flood", "storm surge", "hurricane", "tropical storm",
   "tornado", "cyclone", "typhoon", "wildfire", "bushfire", "forest fire",
   "earthquake", "aftershock", "tsunami", "volcano", "eruption",
   "landslide", "mudslide", "blizzard", "heatwave", "drought",
   "avalanche", "hailstorm", "dust storm", "severe weather",
-  // Impacts and response
-  "evacuation", "shelter", "rescue", "emergency", "disaster",
-  "power outage", "blackout", "road closure", "infrastructure damage",
-  "relief effort", "aid agency", "civil defense", "FEMA", "Red Cross"
+  "snowstorm", "ice storm", "power outage", "blackout",
+  "evacuation", "evacuations", "shelter", "rescue"
 ];
 
-// --- Helper: derive geo point from text -------------------------------------
+// 🚫 Non-disaster / foreign / political blocklist ----------------------------
+const BLOCK_TERMS = /(gaza|israel|ukraine|russia|idf|hamas|hezbollah|missile|airstrike|attack|smuggler|drug|cartel|shooting|murder|politic|election|redistrict|party|military|conflict|war|border patrol|terror|crime)/i;
+
+// --- Geo logic --------------------------------------------------------------
 function tryLocationFromText(text) {
   if (!text) return null;
   const lower = text.toLowerCase();
 
-  // --- 1️⃣ County-level match -------------------------------------
-  for (const [stateCode, meta] of Object.entries(countyCenters)) {
-    for (const [countyName, coords] of Object.entries(meta)) {
+  // 1️⃣ County-level match
+  for (const [stateCode, counties] of Object.entries(countyCenters)) {
+    for (const [countyName, coords] of Object.entries(counties)) {
       if (Array.isArray(coords) && lower.includes(countyName.toLowerCase())) {
         return {
           type: "Point",
@@ -50,7 +50,10 @@ function tryLocationFromText(text) {
     }
   }
 
-  // --- 2️⃣ State-level match ---------------------------------------
+  // 2️⃣ State-level (only if hazard word present)
+  const hasHazard = CORE_HAZARDS.some(k => lower.includes(k));
+  if (!hasHazard) return null;
+
   const stateMatch = lower.match(
     /\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming)\b|(\bAL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b/g
   );
@@ -59,7 +62,6 @@ function tryLocationFromText(text) {
     const foundState = stateMatch[0].toUpperCase().slice(0, 2);
     const counties = countyCenters[foundState];
     if (counties && Object.keys(counties).length) {
-      // Compute mean centroid from all counties
       const coordsArray = Object.values(counties).filter(Array.isArray);
       const avgLon =
         coordsArray.reduce((sum, c) => sum + c[0], 0) / coordsArray.length;
@@ -75,28 +77,28 @@ function tryLocationFromText(text) {
     }
   }
 
-  // --- 3️⃣ No match found ------------------------------------------
   return null;
 }
 
-
-// --- Normalize and filter article -------------------------------------------
+// --- Normalize and filter article ------------------------------------------
 function normalizeArticle(article) {
   try {
-    const text = `${article.title || ""} ${article.description || ""}`;
-    const lower = text.toLowerCase();
+    const title = (article.title || "").trim();
+    const desc = (article.description || "").trim();
+    const text = `${title} ${desc}`.toLowerCase();
 
-    // Allow looser matching — at least one keyword anywhere in title or description
-    const matches = KEYWORDS.filter(k => lower.includes(k));
-    if (matches.length === 0) {
-      // no direct keyword hit, but maybe it’s disaster-related by source?
-      const disasterish = /(storm|flood|earthquake|fire|disaster|emergency|evacuat|outage)/i;
-      if (!disasterish.test(text)) return null;
-    }
+    // Skip if blacklisted (political / war / crime / etc.)
+    if (BLOCK_TERMS.test(text)) return null;
 
+    // Must contain a core hazard keyword
+    const hasHazard = CORE_HAZARDS.some(k => text.includes(k));
+    if (!hasHazard) return null;
+
+    // Must geolocate to U.S.
     const geometry = tryLocationFromText(text);
     if (!geometry) return null;
 
+    // Extract domain
     let domain = "";
     try {
       const u = new URL(article.url);
@@ -104,14 +106,14 @@ function normalizeArticle(article) {
     } catch (_) {}
 
     return {
-      title: article.title || "News Update",
-      description: article.description || "",
+      title: title || "News Update",
+      description: desc,
       url: article.url || "",
       source: article.source?.name || domain || "Unknown",
       domain,
       publishedAt: new Date(article.publishedAt || Date.now()),
       geometry,
-      geometryMethod: geometry.method || "newsapi-geo",
+      geometryMethod: geometry.method,
       timestamp: new Date(),
       expires: new Date(Date.now() + 2 * 60 * 60 * 1000)
     };
@@ -121,31 +123,37 @@ function normalizeArticle(article) {
   }
 }
 
-// --- Save to Mongo ----------------------------------------------------------
+// --- Save to Mongo ---------------------------------------------------------
 async function saveNewsArticles(articles) {
   try {
     const db = getDB();
     const collection = db.collection("social_signals");
+
+    // Remove expired
     await collection.deleteMany({ expires: { $lte: new Date() } });
 
     for (const a of articles) {
       await collection.updateOne({ url: a.url }, { $set: a }, { upsert: true });
     }
+
     console.log(`💾 Saved ${articles.length} news articles`);
   } catch (err) {
     console.error("❌ Error saving news articles:", err.message);
   }
 }
 
-// --- Poller main ------------------------------------------------------------
+// --- Poller main -----------------------------------------------------------
 async function pollNewsAPI() {
-  console.log("📰 News Poller running (broad discovery + county→state→US geo)...");
+  console.log("📰 News Poller running (strict U.S. disaster focus)...");
   try {
-    const sample = KEYWORDS.sort(() => 0.5 - Math.random()).slice(0, 12);
+    const sample = CORE_HAZARDS.sort(() => 0.5 - Math.random()).slice(0, 10);
     const query = sample.join(" OR ");
-    // Broaden by focusing on disaster-relevant outlets
-    const disasterSources = "cnn,bbc-news,associated-press,reuters,the-weather-channel,abc-news,nbc-news";
-    const url = `${NEWS_API_URL}?q=${encodeURIComponent(query)}&sources=${disasterSources}&language=en&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
+    const sources =
+      "cnn,bbc-news,associated-press,reuters,the-weather-channel,abc-news,nbc-news";
+
+    const url = `${NEWS_API_URL}?q=${encodeURIComponent(
+      query
+    )}&sources=${sources}&language=en&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
 
     console.log("🔍 NewsAPI URL:", url);
     console.log("🔑 API Key present?", !!NEWS_API_KEY);
@@ -157,19 +165,29 @@ async function pollNewsAPI() {
     }
 
     const normalized = data.articles.map(normalizeArticle).filter(Boolean);
-    console.log(`✅ Parsed ${normalized.length} relevant of ${data.articles.length} total`);
+    console.log(
+      `✅ Parsed ${normalized.length} relevant of ${data.articles.length} total`
+    );
+
     if (normalized.length) {
       console.log(
         normalized
           .slice(0, 5)
-          .map(a => `🌎 ${a.title} — ${a.source} (${a.geometryMethod})`)
+          .map(
+            (a) =>
+              `🌎 ${a.title} — ${a.source} (${a.geometry.state || "?"}, ${a.geometryMethod})`
+          )
           .join("\n")
       );
       await saveNewsArticles(normalized);
     }
   } catch (err) {
     if (err.response) {
-      console.error("❌ NewsAPI error:", err.response.status, err.response.data);
+      console.error(
+        "❌ NewsAPI error:",
+        err.response.status,
+        err.response.data
+      );
     } else {
       console.error("❌ NewsAPI request failed:", err.message);
     }
