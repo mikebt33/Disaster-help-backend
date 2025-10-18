@@ -115,7 +115,7 @@ function normalizeArticle(article) {
       geometry,
       geometryMethod: geometry.method,
       timestamp: new Date(),
-      expires: new Date(Date.now() + 2 * 60 * 60 * 1000) // 2 hours
+      expires: new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours
     };
   } catch (err) {
     console.warn("❌ Error normalizing article:", err.message);
