@@ -426,9 +426,33 @@ async function fetchCapFeed(feed){
 }
 
 /** Run all feeds */
-async function pollCapFeeds(){
+async function pollCapFeeds() {
   console.log("🚨 CAP Poller running...");
-  for(const feed of CAP_FEEDS)await fetchCapFeed(feed);
+
+  // --- TTL cleanup fallback ---
+  try {
+    const db = getDB();
+    const collection = db.collection("alerts_cap");
+    const now = new Date();
+
+    // Delete expired or malformed alerts
+    const { deletedCount } = await collection.deleteMany({
+      $or: [
+        { expires: { $lte: now } },
+        { expires: { $exists: false } },
+        { expires: null }
+      ]
+    });
+
+    if (deletedCount > 0) {
+      console.log(`🧹 Cleaned up ${deletedCount} expired CAP alerts`);
+    }
+  } catch (err) {
+    console.error("⚠️ TTL cleanup failed:", err.message);
+  }
+
+  // --- Continue normal polling ---
+  for (const feed of CAP_FEEDS) await fetchCapFeed(feed);
   console.log("✅ CAP poll cycle complete.\n");
 }
 
