@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import "dotenv/config";
+console.log("NEWS_API_KEY loaded:", !!process.env.NEWS_API_KEY);
 
 // --- Geo helpers ------------------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
