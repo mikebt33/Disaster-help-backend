@@ -29,54 +29,54 @@ const CORE_HAZARDS = [
 ];
 
 // 🚫 Non-disaster / foreign / political blocklist ----------------------------
-const BLOCK_TERMS = /(gaza|israel|ukraine|russia|idf|hamas|hezbollah|missile|airstrike|attack|smuggler|drug|cartel|shooting|murder|politic|election|redistrict|party|military|conflict|war|border patrol|terror|crime)/i;
+const BLOCK_TERMS = /(gaza|israel|ukraine|russia|idf|hamas|hezbollah|missile|airstrike|attack|smuggler|drug|cartel|shooting|murder|politic|election|redistrict|party|military|conflict|war|terror|crime|border patrol)/i;
 
 // --- Geo logic --------------------------------------------------------------
 function tryLocationFromText(text) {
   if (!text) return null;
   const lower = text.toLowerCase();
 
-  // 1️⃣ County-level match
-  for (const [stateCode, counties] of Object.entries(countyCenters)) {
+  // --- 1️⃣ Detect explicit state name or abbreviation -----------------------
+  const stateMatch = lower.match(
+    /\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming)\b|(\bAL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b/g
+  );
+
+  let matchedState = null;
+  if (stateMatch && stateMatch[0]) {
+    matchedState = stateMatch[0]
+      .toUpperCase()
+      .replace(/[^A-Z]/g, "")
+      .slice(0, 2);
+  }
+
+  // --- 2️⃣ If a state is found, check for a county inside that same state ----
+  if (matchedState && countyCenters[matchedState]) {
+    const counties = countyCenters[matchedState];
     for (const [countyName, coords] of Object.entries(counties)) {
       if (Array.isArray(coords) && lower.includes(countyName.toLowerCase())) {
         return {
           type: "Point",
           coordinates: coords,
           method: "county",
-          state: stateCode
+          state: matchedState
         };
       }
     }
+
+    // No county match; fall back to state centroid
+    const coordsArray = Object.values(counties).filter(Array.isArray);
+    const avgLon = coordsArray.reduce((sum, c) => sum + c[0], 0) / coordsArray.length;
+    const avgLat = coordsArray.reduce((sum, c) => sum + c[1], 0) / coordsArray.length;
+
+    return {
+      type: "Point",
+      coordinates: [avgLon, avgLat],
+      method: "state",
+      state: matchedState
+    };
   }
 
-  // 2️⃣ State-level (only if hazard word present)
-  const hasHazard = CORE_HAZARDS.some(k => lower.includes(k));
-  if (!hasHazard) return null;
-
-  const stateMatch = lower.match(
-    /\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming)\b|(\bAL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b/g
-  );
-
-  if (stateMatch && stateMatch[0]) {
-    const foundState = stateMatch[0].toUpperCase().slice(0, 2);
-    const counties = countyCenters[foundState];
-    if (counties && Object.keys(counties).length) {
-      const coordsArray = Object.values(counties).filter(Array.isArray);
-      const avgLon =
-        coordsArray.reduce((sum, c) => sum + c[0], 0) / coordsArray.length;
-      const avgLat =
-        coordsArray.reduce((sum, c) => sum + c[1], 0) / coordsArray.length;
-
-      return {
-        type: "Point",
-        coordinates: [avgLon, avgLat],
-        method: "state",
-        state: foundState
-      };
-    }
-  }
-
+  // --- 3️⃣ If no state, skip entirely ---------------------------------------
   return null;
 }
 
@@ -87,14 +87,14 @@ function normalizeArticle(article) {
     const desc = (article.description || "").trim();
     const text = `${title} ${desc}`.toLowerCase();
 
-    // Skip if blacklisted (political / war / crime / etc.)
+    // Skip irrelevant topics
     if (BLOCK_TERMS.test(text)) return null;
 
-    // Must contain a core hazard keyword
+    // Must contain at least one core hazard
     const hasHazard = CORE_HAZARDS.some(k => text.includes(k));
     if (!hasHazard) return null;
 
-    // Must geolocate to U.S.
+    // Must geolocate to a U.S. state
     const geometry = tryLocationFromText(text);
     if (!geometry) return null;
 
@@ -115,7 +115,7 @@ function normalizeArticle(article) {
       geometry,
       geometryMethod: geometry.method,
       timestamp: new Date(),
-      expires: new Date(Date.now() + 2 * 60 * 60 * 1000)
+      expires: new Date(Date.now() + 2 * 60 * 60 * 1000) // 2 hours
     };
   } catch (err) {
     console.warn("❌ Error normalizing article:", err.message);
@@ -129,7 +129,7 @@ async function saveNewsArticles(articles) {
     const db = getDB();
     const collection = db.collection("social_signals");
 
-    // Remove expired
+    // Clean expired
     await collection.deleteMany({ expires: { $lte: new Date() } });
 
     for (const a of articles) {
@@ -144,7 +144,7 @@ async function saveNewsArticles(articles) {
 
 // --- Poller main -----------------------------------------------------------
 async function pollNewsAPI() {
-  console.log("📰 News Poller running (strict U.S. disaster focus)...");
+  console.log("📰 News Poller running (strict U.S. disaster focus, correct-state mapping)...");
   try {
     const sample = CORE_HAZARDS.sort(() => 0.5 - Math.random()).slice(0, 10);
     const query = sample.join(" OR ");
@@ -165,16 +165,14 @@ async function pollNewsAPI() {
     }
 
     const normalized = data.articles.map(normalizeArticle).filter(Boolean);
-    console.log(
-      `✅ Parsed ${normalized.length} relevant of ${data.articles.length} total`
-    );
+    console.log(`✅ Parsed ${normalized.length} relevant of ${data.articles.length} total`);
 
     if (normalized.length) {
       console.log(
         normalized
           .slice(0, 5)
           .map(
-            (a) =>
+            a =>
               `🌎 ${a.title} — ${a.source} (${a.geometry.state || "?"}, ${a.geometryMethod})`
           )
           .join("\n")
@@ -183,11 +181,7 @@ async function pollNewsAPI() {
     }
   } catch (err) {
     if (err.response) {
-      console.error(
-        "❌ NewsAPI error:",
-        err.response.status,
-        err.response.data
-      );
+      console.error("❌ NewsAPI error:", err.response.status, err.response.data);
     } else {
       console.error("❌ NewsAPI request failed:", err.message);
     }
