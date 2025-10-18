@@ -38,13 +38,13 @@ function tryLocationFromText(text) {
 
   // --- 1️⃣ County-level match -------------------------------------
   for (const [stateCode, meta] of Object.entries(countyCenters)) {
-    const counties = meta.counties || {};
-    for (const [countyName, cData] of Object.entries(counties)) {
-      if (lower.includes(countyName.toLowerCase())) {
+    for (const [countyName, coords] of Object.entries(meta)) {
+      if (Array.isArray(coords) && lower.includes(countyName.toLowerCase())) {
         return {
           type: "Point",
-          coordinates: cData.center || [0, 0],
-          method: "county"
+          coordinates: coords,
+          method: "county",
+          state: stateCode
         };
       }
     }
@@ -57,19 +57,28 @@ function tryLocationFromText(text) {
 
   if (stateMatch && stateMatch[0]) {
     const foundState = stateMatch[0].toUpperCase().slice(0, 2);
-    if (countyCenters[foundState]?.__center) {
+    const counties = countyCenters[foundState];
+    if (counties && Object.keys(counties).length) {
+      // Compute mean centroid from all counties
+      const coordsArray = Object.values(counties).filter(Array.isArray);
+      const avgLon =
+        coordsArray.reduce((sum, c) => sum + c[0], 0) / coordsArray.length;
+      const avgLat =
+        coordsArray.reduce((sum, c) => sum + c[1], 0) / coordsArray.length;
+
       return {
         type: "Point",
-        coordinates: countyCenters[foundState].__center,
-        method: "state"
+        coordinates: [avgLon, avgLat],
+        method: "state",
+        state: foundState
       };
     }
   }
 
   // --- 3️⃣ No match found ------------------------------------------
-  // Return null so we skip saving this article.
   return null;
 }
+
 
 // --- Normalize and filter article -------------------------------------------
 function normalizeArticle(article) {
