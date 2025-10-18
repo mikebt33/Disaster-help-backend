@@ -67,7 +67,13 @@ function normalizeArticle(article) {
     const text = `${article.title || ""} ${article.description || ""}`;
     const lower = text.toLowerCase();
 
-    if (!KEYWORDS.some(k => lower.includes(k))) return null;
+    // Allow looser matching — at least one keyword anywhere in title or description
+    const matches = KEYWORDS.filter(k => lower.includes(k));
+    if (matches.length === 0) {
+      // no direct keyword hit, but maybe it’s disaster-related by source?
+      const disasterish = /(storm|flood|earthquake|fire|disaster|emergency|evacuat|outage)/i;
+      if (!disasterish.test(text)) return null;
+    }
 
     const geometry = tryLocationFromText(text);
     if (!geometry) return null;
@@ -118,7 +124,9 @@ async function pollNewsAPI() {
   try {
     const sample = KEYWORDS.sort(() => 0.5 - Math.random()).slice(0, 12);
     const query = sample.join(" OR ");
-    const url = `${NEWS_API_URL}?q=${encodeURIComponent(query)}&language=en&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
+    // Broaden by focusing on disaster-relevant outlets
+    const disasterSources = "cnn,bbc-news,associated-press,reuters,the-weather-channel,abc-news,nbc-news";
+    const url = `${NEWS_API_URL}?q=${encodeURIComponent(query)}&sources=${disasterSources}&language=en&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
 
     console.log("🔍 NewsAPI URL:", url);
     console.log("🔑 API Key present?", !!NEWS_API_KEY);
