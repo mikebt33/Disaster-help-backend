@@ -22,7 +22,7 @@ import { haversineDistanceMi } from "../utils/geoUtils.js";
 // --- In-memory send guard (use Redis if you run >1 instance) ---
 const recentlySent = new Map(); // key -> timestamp
 const TTL_MS = 60_000; // 60s dedupe window
-const DEFAULT_RADIUS_MI = Number(process.env.DEFAULT_RADIUS_MI || 10);
+const DEFAULT_RADIUS_MI = Number(process.env.DEFAULT_RADIUS_MI || 200);
 
 function _markSent(key) {
   recentlySent.set(key, Date.now());
@@ -134,15 +134,13 @@ export async function notifyNearbyUsers(collection, doc, opts = {}) {
         continue;
       }
 
-      // ✅ Geofence filter (Haversine distance)
+      // ✅ Always include events inside user's geofence OR default 200 mi
       const userRadiusMi = u.radiusMi || DEFAULT_RADIUS_MI;
       const distMi = haversineDistanceMi(
-        eventLat,
-        eventLng,
-        u.lastLocation.lat,
-        u.lastLocation.lng
+        eventLat, eventLng, u.lastLocation.lat, u.lastLocation.lng
       );
-      if (distMi > userRadiusMi) continue;
+      if (distMi <= userRadiusMi) inside++;
+      else continue;  // skip only when clearly outside
 
       inside++;
 
