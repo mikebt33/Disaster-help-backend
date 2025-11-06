@@ -348,22 +348,10 @@ function normalizeArticle(article) {
     const content = (article.content || "").trim();
     const text = `${title}\n${desc}\n${content}`;
 
-    if (HARD_BLOCK.test(text) || FOREIGN.test(text) || FIGURATIVE.test(text)) {
-      if (DEBUG) console.log("🧹 Drop early (block/foreign/figurative):", title);
-      return null;
-    }
-
-    // Use a *fresh* regex (no /g state bug)
-    if (!makeHazardRe("i").test(text)) {
-      if (DEBUG) console.log("🧹 Drop: no strict hazard:", title);
-      return null;
-    }
+    if (!title || /taylor swift|election|hollywood/i.test(text)) return null;
 
     const geometry = extractLocation(text);
-    if (!geometry) {
-      if (DEBUG) console.log("🧹 Drop: no geometry:", title);
-      return null;
-    }
+    if (!geometry) return null;
 
     let domain = "";
     try {
@@ -380,9 +368,7 @@ function normalizeArticle(article) {
       publishedAt: new Date(article.publishedAt || Date.now()),
       geometry,
       geometryMethod: geometry.method,
-      timestamp: new Date(),
-      createdAt: new Date(), // 🔥 critical: TTL anchor for Mongo
-      expires: new Date(Date.now() + 24 * 60 * 60 * 1000) // (optional: may remove later)
+      createdAt: new Date(), // TTL anchor for Mongo
     };
   } catch (err) {
     console.warn("❌ Error normalizing article:", err.message);
@@ -390,20 +376,27 @@ function normalizeArticle(article) {
   }
 }
 
-// -------------------- Save to Mongo --------------------
+// -------------------- Save to Mongo (TTL-safe) --------------------
 async function saveNewsArticles(articles) {
   try {
     const db = getDB();
     const col = db.collection("social_signals");
-    // Clean expired
-    await col.deleteMany({ expires: { $lte: new Date() } });
 
     for (const a of articles) {
-      // Upsert by URL; ignore if missing URL
       if (!a.url) continue;
-      await col.updateOne({ url: a.url }, { $set: a }, { upsert: true });
+      await col.updateOne(
+        { url: a.url },
+        {
+          $set: {
+            ...a,
+            createdAt: new Date(), // 🔥 always refresh TTL on upsert
+          },
+        },
+        { upsert: true }
+      );
     }
-    console.log(`💾 Saved ${articles.length} news articles`);
+
+    console.log(`💾 Saved ${articles.length} news articles (TTL refreshed)`);
   } catch (err) {
     console.error("❌ Error saving news articles:", err.message);
   }
@@ -411,9 +404,8 @@ async function saveNewsArticles(articles) {
 
 // -------------------- Poller main --------------------
 export async function pollNewsAPI() {
-  console.log("📰 News Poller running (strict U.S. disaster focus; conservative mapping)…");
+  console.log("📰 News Poller running (strict U.S. disaster focus)…");
   try {
-    // Compose a stable, high-signal query (avoid weak tokens like plain "flood")
     const queryTokens = [
       "flash flood", "storm surge", "hurricane", "tropical storm",
       "tornado", "wildfire", "earthquake", "tsunami", "landslide", "mudslide",
@@ -422,7 +414,10 @@ export async function pollNewsAPI() {
     const query = queryTokens.join(" OR ");
 
     const sources = "cnn,bbc-news,associated-press,reuters,the-weather-channel,abc-news,nbc-news";
-    const url = `${NEWS_API_URL}?q=${encodeURIComponent(query)}&sources=${sources}&language=en&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
+
+    // 🔥 Fetch only the last 24 hours
+    const from = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const url = `${NEWS_API_URL}?q=${encodeURIComponent(query)}&sources=${sources}&language=en&from=${from}&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
 
     console.log("🔍 NewsAPI URL:", url);
     console.log("🔑 API Key present?", !!NEWS_API_KEY);
@@ -433,20 +428,14 @@ export async function pollNewsAPI() {
       return;
     }
 
-    // Normalize and keep only high-confidence results
     const normalized = data.articles
       .map(normalizeArticle)
       .filter(Boolean)
-      .filter((a) => (a.geometry?.confidence ?? 0) >= 2); // only state-confirmed or county+state
+      .filter((a) => (a.geometry?.confidence ?? 0) >= 2);
 
     console.log(`✅ Parsed ${normalized.length} relevant of ${data.articles.length} total`);
+
     if (normalized.length) {
-      console.log(
-        normalized
-          .slice(0, 6)
-          .map((a) => `🌎 ${a.title} — ${a.source} (${a.geometry.state}, ${a.geometryMethod})`)
-          .join("\n")
-      );
       await saveNewsArticles(normalized);
     }
   } catch (err) {
