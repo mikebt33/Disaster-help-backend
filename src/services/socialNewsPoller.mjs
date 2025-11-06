@@ -416,8 +416,11 @@ export async function pollNewsAPI() {
     const sources = "cnn,bbc-news,associated-press,reuters,the-weather-channel,abc-news,nbc-news";
 
     // 🔥 Fetch only the last 24 hours
-    const from = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const url = `${NEWS_API_URL}?q=${encodeURIComponent(query)}&sources=${sources}&language=en&from=${from}&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
+    const now = new Date();
+    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const to = now.toISOString();
+
+    const url = `${NEWS_API_URL}?q=${encodeURIComponent(query)}&sources=${sources}&language=en&from=${from}&to=${to}&sortBy=publishedAt&pageSize=50&language=en&apiKey=${NEWS_API_KEY}`;
 
     console.log("🔍 NewsAPI URL:", url);
     console.log("🔑 API Key present?", !!NEWS_API_KEY);
