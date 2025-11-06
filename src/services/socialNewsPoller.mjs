@@ -381,7 +381,8 @@ function normalizeArticle(article) {
       geometry,
       geometryMethod: geometry.method,
       timestamp: new Date(),
-      expires: new Date(Date.now() + 24 * 60 * 60 * 1000) // 24h TTL
+      createdAt: new Date(), // 🔥 critical: TTL anchor for Mongo
+      expires: new Date(Date.now() + 24 * 60 * 60 * 1000) // (optional: may remove later)
     };
   } catch (err) {
     console.warn("❌ Error normalizing article:", err.message);
