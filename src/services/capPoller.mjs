@@ -29,6 +29,7 @@ const CAP_FEEDS = [
     name: `${s} NWS Feed`,
     url: `https://alerts.weather.gov/cap/${s.toLowerCase()}.php?x=0`,
     source: "NWS",
+    stateHint: s,
   })),
 ];
 
@@ -169,24 +170,42 @@ function normalizeCountyName(raw) {
   return s;
 }
 
-function tryCountyCenterFromAreaDesc(areaDesc) {
+function tryCountyCenterFromAreaDesc(areaDesc, stateHint) {
   if (!areaDesc) return null;
 
-  const stateHints = extractStateAbbrs(areaDesc); // may be [], [abbr], or multiple
-  const regions = areaDesc.split(/[,;]+/).map(s => s.trim()).filter(Boolean);
+  // If the feed tells us the state (e.g., NY feed), trust that first.
+  // Otherwise fall back to extracting from text (for national/FEMA feeds).
+  let stateHints = [];
+  if (stateHint) {
+    stateHints = [stateHint];
+  } else {
+    stateHints = extractStateAbbrs(areaDesc); // may be [], [abbr], or multiple
+  }
+
+  const regions = areaDesc
+    .split(/[,;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 
   for (const r of regions) {
-    // "Smith County, TX" or "Smith, TX" or "... , Texas"
+    // "Smith County, TX" or "Smith, TX" or "Smith, Texas"
     let m = r.match(/^(.+?),\s*([A-Za-z .]+)$/);
     if (m) {
       const county = normalizeCountyName(m[1]);
-      const abbr = stateToAbbr(m[2]);
+      let abbr = stateToAbbr(m[2]); // explicit code/name if present in this region
+
+      // If this region doesn't specify a state, but the feed has exactly one hint,
+      // use that (e.g., NY feed).
+      if (!abbr && stateHints.length === 1) {
+        abbr = stateHints[0];
+      }
+
       if (abbr && countyCenters[abbr]?.[county]) {
         return { type: "Point", coordinates: countyCenters[abbr][county] };
       }
     }
 
-    // County-only token AND exactly one state hint in the whole string
+    // County-only token AND exactly one state hint total
     if (stateHints.length === 1 && /^[A-Za-z .'-]+$/.test(r)) {
       const countyOnly = normalizeCountyName(r);
       const abbr = stateHints[0];
@@ -201,9 +220,13 @@ function tryCountyCenterFromAreaDesc(areaDesc) {
 
 /* ------------------- Normalization ------------------- */
 
-function normalizeCapAlert(entry,source){
-  try{
-    const root=entry["cap:alert"]||entry.alert||entry.content?.["cap:alert"]||entry;
+function normalizeCapAlert(entry, feed) {
+  try {
+    const source = feed.source;
+    const stateHint = feed.stateHint || null;
+
+    const root = entry["cap:alert"] || entry.alert || entry.content?.["cap:alert"] || entry;
+
     const info=Array.isArray(root?.info)?root.info[0]:root?.info||{};
     const area=Array.isArray(info?.area)?info.area[0]:info?.area||{};
 
@@ -244,24 +267,35 @@ function normalizeCapAlert(entry,source){
 
     // --- County center lookup to avoid US centroid stacking ---
     if (!geometry && area?.areaDesc) {
-      const countyPoint = tryCountyCenterFromAreaDesc(area.areaDesc);
+      const countyPoint = tryCountyCenterFromAreaDesc(area.areaDesc, stateHint);
       if (countyPoint) {
         geometry = countyPoint;
         geometryMethod = "county-center";
-        console.log(`✅ County-center match: ${area.areaDesc}`);
+        console.log(
+          `✅ County-center match: ${area.areaDesc} [stateHint=${stateHint || "none"}]`
+        );
       }
     }
 
     // --- Fallback to state center (supports codes + full names) ---
-    if(!geometry){
+    if (!geometry) {
       const desc = area?.areaDesc || root?.areaDesc || "";
-      const stateList = extractStateAbbrs(desc);
+
+      let stateList = [];
+
+      // Prefer the feed's stateHint (e.g., NY feed) if we have one.
+      if (stateHint) {
+        stateList = [stateHint];
+      } else {
+        stateList = extractStateAbbrs(desc); // for national/FEMA feeds
+      }
+
       if (stateList.length > 0) {
-        const abbr = stateList[0]; // first mention
+        const abbr = stateList[0]; // first mention or hint
         if (STATE_CENTERS[abbr]) {
           geometry = { type: "Point", coordinates: STATE_CENTERS[abbr] };
           geometryMethod = "state-center";
-          console.log(`🗺️ Fallback to state center: ${abbr} (${area.areaDesc})`);
+          console.log(`🗺️ Fallback to state center: ${abbr} (${area.areaDesc || "(no areaDesc)"})`);
         }
       }
     }
@@ -432,7 +466,7 @@ async function fetchCapFeed(feed){
     const json=parser.parse(xml);
     let entries=json.alert?[json.alert]:json.feed?.entry||[];
     if(!Array.isArray(entries))entries=[entries];
-    const alerts=entries.map(e=>normalizeCapAlert(e,feed.source)).filter(Boolean);
+    const alerts = entries.map((e) => normalizeCapAlert(e, feed)).filter(Boolean);
     const usable=alerts.filter(a=>a.hasGeometry).length;
     console.log(`✅ Parsed ${alerts.length} alerts from ${feed.source} (${usable} usable geo)`);
     if(alerts.length)await saveAlerts(alerts);
