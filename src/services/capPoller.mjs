@@ -466,7 +466,7 @@ async function fetchCapFeed(feed){
     const json=parser.parse(xml);
     let entries=json.alert?[json.alert]:json.feed?.entry||[];
     if(!Array.isArray(entries))entries=[entries];
-    const alerts = entries.map((e) => normalizeCapAlert(e, feed)).filter(Boolean);
+    const alerts = entries.map(e => normalizeCapAlert(e, feed)).filter(Boolean);
     const usable=alerts.filter(a=>a.hasGeometry).length;
     console.log(`✅ Parsed ${alerts.length} alerts from ${feed.source} (${usable} usable geo)`);
     if(alerts.length)await saveAlerts(alerts);
