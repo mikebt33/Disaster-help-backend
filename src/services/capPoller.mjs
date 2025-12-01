@@ -386,16 +386,18 @@ function normalizeCapAlert(entry, feed) {
     if (!geometry) {
       let abbr = stateHint;
 
-      if (!abbr) {
-        const guessList = extractStateAbbrs(
-          areaDesc ||
-          info.headline ||
-          root.title ||
-          root.summary ||
-          ""
-        );
-        abbr = guessList[0];
-      }
+     // If we have a stateHint (from feed), ALWAYS trust it.
+     // County-based NWS feeds do not include state names in areaDesc.
+     if (!abbr && stateHint) {
+       abbr = stateHint;
+     }
+
+     // Only if NO stateHint exists, then try to guess from text.
+     // (Rare, mostly FEMA/national alerts)
+     if (!abbr) {
+       const guessList = extractStateAbbrs(areaDesc || info.headline || root.title || root.summary || "");
+       abbr = guessList[0];
+     }
 
       if (abbr && STATE_CENTERS[abbr]) {
         geometry = { type: "Point", coordinates: STATE_CENTERS[abbr] };
