@@ -343,7 +343,7 @@ export async function pollNewsAPI() {
       "storm damage", "winter storm", "extreme heat"
     ];
 
-    const query = queryTokens.join(" OR ");
+    const query = queryTokens.join(" ");
 
     // 🔥 Removed source restriction — allows local/regional reporting
     const sources = "";
