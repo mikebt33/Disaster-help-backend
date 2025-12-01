@@ -235,68 +235,88 @@ function normalizeCapAlert(entry, feed) {
     if(Array.isArray(polygonRaw)) polygonRaw=polygonRaw.join(" ");
     const polygonGeom=parsePolygon(polygonRaw);
 
-    // --- Geometry ---
-    let geometry=null;
-    let geometryMethod=null;
+    // -------------------- GEOMETRY LOGIC (correct priority) --------------------
 
-    if(polygonGeom){
-      geometry=polygonCentroid(polygonGeom);
-      geometryMethod="polygon";
+    let geometry = null;
+    let geometryMethod = null;
+
+    // 1) Polygon centroid (highest fidelity)
+    if (polygonGeom) {
+      geometry = polygonCentroid(polygonGeom);
+      geometryMethod = "polygon";
     }
 
-    if(!geometry){
-      const pointStr=root?.point||root?.["georss:point"];
-      if(typeof pointStr==="string"){
-        const parts=pointStr.trim().split(/\s+/).map(Number);
-        if(parts.length>=2&&!isNaN(parts[0])&&!isNaN(parts[1])){
-          const[lat,lon]=parts;
-          geometry={type:"Point",coordinates:[lon,lat]};
-          geometryMethod="georss-point";
-        }
-      }
-    }
-
-    if(!geometry){
-      const lat=parseFloat(info?.lat||area?.lat);
-      const lon=parseFloat(info?.lon||area?.lon);
-      if(!isNaN(lat)&&!isNaN(lon)){
-        geometry={type:"Point",coordinates:[lon,lat]};
-        geometryMethod="explicit-latlon";
-      }
-    }
-
-    // --- County center lookup to avoid US centroid stacking ---
-    if (!geometry && area?.areaDesc) {
-      const countyPoint = tryCountyCenterFromAreaDesc(area.areaDesc, stateHint);
-      if (countyPoint) {
-        geometry = countyPoint;
-        geometryMethod = "county-center";
-        console.log(
-          `✅ County-center match: ${area.areaDesc} [stateHint=${stateHint || "none"}]`
-        );
-      }
-    }
-
-    // --- Fallback to state center (supports codes + full names) ---
+    // 2) georss:point (usually precise)
     if (!geometry) {
-      const desc = area?.areaDesc || root?.areaDesc || "";
+      const pointStr =
+        root?.georss_point ||
+        root?.["georss:point"] ||
+        root?.point;
 
-      let stateList = [];
+      if (typeof pointStr === "string") {
+        const parts = pointStr.trim().split(/\s+/).map(Number);
+        if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+          const [lat, lon] = parts;
+          geometry = { type: "Point", coordinates: [lon, lat] };
+          geometryMethod = "georss-point";
+        }
+      }
+    }
 
-      // Prefer the feed's stateHint (e.g., NY feed) if we have one.
-      if (stateHint) {
-        stateList = [stateHint];
-      } else {
-        stateList = extractStateAbbrs(desc); // for national/FEMA feeds
+    // 3) Explicit lat/lon fields
+    if (!geometry) {
+      const lat = parseFloat(info?.lat || area?.lat);
+      const lon = parseFloat(info?.lon || area?.lon);
+      if (!isNaN(lat) && !isNaN(lon)) {
+        geometry = { type: "Point", coordinates: [lon, lat] };
+        geometryMethod = "explicit-latlon";
+      }
+    }
+
+    // 4) Multi-county centroid (fixes stacked alerts)
+    if (!geometry && area?.areaDesc) {
+      const regions = area.areaDesc
+        .split(/[,;]+/)
+        .map((s) => normalizeCountyName(s.trim()))
+        .filter(Boolean);
+
+      let countyPoints = [];
+
+      for (const countyName of regions) {
+        if (!countyName) continue;
+
+        const abbr = stateHint; // trust feed state
+        if (abbr && countyCenters[abbr]?.[countyName]) {
+          countyPoints.push(countyCenters[abbr][countyName]);
+        }
       }
 
-      if (stateList.length > 0) {
-        const abbr = stateList[0]; // first mention or hint
-        if (STATE_CENTERS[abbr]) {
-          geometry = { type: "Point", coordinates: STATE_CENTERS[abbr] };
-          geometryMethod = "state-center";
-          console.log(`🗺️ Fallback to state center: ${abbr} (${area.areaDesc || "(no areaDesc)"})`);
-        }
+      if (countyPoints.length === 1) {
+        geometry = { type: "Point", coordinates: countyPoints[0] };
+        geometryMethod = "county-single";
+      } else if (countyPoints.length > 1) {
+        const avgLon = countyPoints.reduce((s, p) => s + p[0], 0) / countyPoints.length;
+        const avgLat = countyPoints.reduce((s, p) => s + p[1], 0) / countyPoints.length;
+        geometry = { type: "Point", coordinates: [avgLon, avgLat] };
+        geometryMethod = "county-multi-centroid";
+        console.log(`📍 Multi-county centroid (${countyPoints.length} counties): ${area.areaDesc}`);
+      }
+    }
+
+    // 5) LAST fallback → state center
+    if (!geometry) {
+      let abbr = stateHint;
+
+      // If feed doesn't specify a state, guess from text
+      if (!abbr) {
+        const guessList = extractStateAbbrs(area?.areaDesc || root?.areaDesc || "");
+        abbr = guessList[0];
+      }
+
+      if (abbr && STATE_CENTERS[abbr]) {
+        geometry = { type: "Point", coordinates: STATE_CENTERS[abbr] };
+        geometryMethod = "state-center";
+        console.log(`🗺️ STATE fallback: ${abbr} (${area.areaDesc})`);
       }
     }
 
