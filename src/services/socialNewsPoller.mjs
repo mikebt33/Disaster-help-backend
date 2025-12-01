@@ -157,8 +157,8 @@ function extractLocation(textRaw) {
   // Validate real hazard context
   let hasValidatedHazard = false;
   for (const m of hazardMatches) {
-    const start = Math.max(0, m.index - 300);
-    const end = Math.min(text.length, m.index + m[0].length + 300);
+    const start = Math.max(0, m.index - 600);
+    const end = Math.min(text.length, m.index + m[0].length + 600);
     const window = text.slice(start, end);
 
     if (CONTEXT_VALIDATORS.test(window) || !WEAK_ALONE.test(window)) {
