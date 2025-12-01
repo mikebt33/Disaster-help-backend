@@ -357,28 +357,32 @@ function normalizeCapAlert(entry, feed) {
     }
 
     // 4) Multi-county centroid (fixes stacking, uses stateHint)
-    if (!geometry && areaDesc && stateHint) {
-      const regions = areaDesc
-        .split(/[,;]+/)
-        .map((s) => s.trim())
-        .filter(Boolean);
+    if (!geometry && areaDesc) {
+      // Try resolving based strictly on stateHint (preferred)
+      if (stateHint) {
+        const regions = areaDesc
+          .split(/[,;]+/)
+          .map(s => s.trim())
+          .filter(Boolean);
 
-      let countyPoints = [];
+        let pts = [];
 
-      for (const region of regions) {
-        const pt = getCountyCenter(stateHint, region);
-        if (pt) countyPoints.push(pt);
-      }
+        for (const region of regions) {
+          const p = getCountyCenter(stateHint, region);
+          if (p) pts.push(p);
+        }
 
-      if (countyPoints.length === 1) {
-        geometry = { type: "Point", coordinates: countyPoints[0] };
-        geometryMethod = "county-single";
-      } else if (countyPoints.length > 1) {
-        const avgLon = countyPoints.reduce((s, p) => s + p[0], 0) / countyPoints.length;
-        const avgLat = countyPoints.reduce((s, p) => s + p[1], 0) / countyPoints.length;
-        geometry = { type: "Point", coordinates: [avgLon, avgLat] };
-        geometryMethod = "county-multi-centroid";
-        console.log(`📍 Multi-county centroid (${countyPoints.length} counties): ${areaDesc}`);
+        if (pts.length === 1) {
+          geometry = { type: "Point", coordinates: pts[0] };
+          geometryMethod = "county-fallback-single";
+          console.log(`📍 County fallback single match: ${areaDesc}`);
+        } else if (pts.length > 1) {
+          const avgLon = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+          const avgLat = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+          geometry = { type: "Point", coordinates: [avgLon, avgLat] };
+          geometryMethod = "county-fallback-multi-centroid";
+          console.log(`📍 County fallback multi centroid (${pts.length}): ${areaDesc}`);
+        }
       }
     }
 
