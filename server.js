@@ -8,6 +8,7 @@ import { connectDB, getDB } from "./src/db.js";
 import { runCleanup } from "./src/services/cleanupService.js";
 import { pollCapFeeds } from "./src/services/capPoller.mjs";
 import { pollNewsAPI } from "./src/services/socialNewsPoller.mjs";
+import { pollGDELT } from "./src/services/gdeltPoller.mjs";
 import { ensureIndexes } from "./src/db/indexes.mjs";
 import helpRoutes from "./src/routes/helpRequests.js";
 import offerRoutes from "./src/routes/offers.js";
@@ -47,8 +48,8 @@ await Promise.all([
 ]);
 console.log("✅ Geospatial indexes ensured");
 
-// 2️⃣ TTL (Time-To-Live) indexes for automatic cleanup (72 hours)
-const ttlSeconds = 72 * 60 * 60; // 72 hours = 259,200 seconds
+// 2️⃣ TTL (Time-To-Live) indexes (72 hours)
+const ttlSeconds = 72 * 60 * 60;
 await Promise.all([
   db.collection("hazards").createIndex(
     { timestamp: 1 },
@@ -65,7 +66,7 @@ await Promise.all([
 ]);
 console.log(`⏱️ TTL indexes set — data expires after ${ttlSeconds / 3600} hours.`);
 
-// 3️⃣ Schema validation — ensures consistent structure
+// 3️⃣ Schema validation — help_requests
 try {
   await db.command({
     collMod: "help_requests",
@@ -99,7 +100,7 @@ try {
   console.warn("⚠️ Schema validation skipped or already exists:", e.message);
 }
 
-// ✅ Ensure hazards schema matches new structure
+// 4️⃣ Schema validation — hazards
 try {
   await db.command({
     collMod: "hazards",
@@ -134,11 +135,11 @@ try {
   console.warn("⚠️ hazards schema validation skipped or failed:", e.message);
 }
 
-// ✅ Add indexes for the new social/news layer
+// 5️⃣ Social/news TTL + geo indexes
 await ensureIndexes();
 console.log("✅ Social/news indexes ensured");
 
-// Optional: remove CAP alerts older than 7 days
+// Optional: prune old CAP alerts older than 7 days
 await db.collection("alerts_cap").deleteMany({
   sent: { $lt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
 });
@@ -152,9 +153,9 @@ app.use("/api/hazards", hazardRoutes);
 app.use("/api/alerts-cap", alertRoutes);
 app.use("/api/social-signals", socialRoutes);
 app.use("/api/user", userRoutes);
-app.use("/api", followRouter); // keep last
+app.use("/api", followRouter);
 
-// 🩺 Health check
+// Health check
 app.get("/healthz", async (_req, res) => {
   try {
     await db.command({ ping: 1 });
@@ -173,13 +174,13 @@ app.get("/", (_req, res) => {
 // 🕓 Cron Jobs
 // ---------------------------------------------------------------------------
 
-// Cleanup once per day at 2 AM UTC
+// Daily cleanup (2AM UTC)
 cron.schedule("0 2 * * *", async () => {
   console.log("⏱️ Scheduled cleanup starting...");
   await runCleanup();
 });
 
-// CAP poller — initial + every 5 minutes
+// CAP poller
 console.log("⏱️ Initial CAP feed poll on startup...");
 await pollCapFeeds();
 
@@ -188,13 +189,20 @@ cron.schedule("*/5 * * * *", async () => {
   await pollCapFeeds();
 });
 
-// 📰 News poller — initial + every 15 minutes
+// NEWS poller (initial + every 15 minutes)
 console.log("📰 Initial NewsAPI poll on startup...");
 await pollNewsAPI();
+
+// GDELT poller (initial + every 15 minutes)
+console.log("🌎 Initial GDELT poll on startup...");
+await pollGDELT();
 
 cron.schedule("*/15 * * * *", async () => {
   console.log("📰 Scheduled NewsAPI polling running...");
   await pollNewsAPI();
+
+  console.log("🌎 Scheduled GDELT polling running...");
+  await pollGDELT();
 });
 
 // ---------------------------------------------------------------------------
