@@ -107,14 +107,21 @@ export async function pollGDELT() {
       // ---- Filters ----
 
       // Only United States events (FIPS code "US")
-      if (actionGeoCountry !== "US") continue;
+      const txt = (actionGeoFullName || "").toLowerCase();
+      const isUS =
+        actionGeoCountry === "US" ||
+        txt.includes("united states") ||
+        txt.includes("usa") ||
+        txt.match(/\b(AK|AL|AR|AZ|CA|CO|CT|DC|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV)\b/i);
+
+      if (!isUS) continue;
 
       // Require usable geometry
       if (isNaN(actionGeoLat) || isNaN(actionGeoLon)) continue;
 
       // Keep only clearly negative / impactful events
       // (GoldsteinScale strongly negative OR AvgTone notably negative)
-      if (!(goldstein <= -5 || avgTone <= -3)) continue;
+      if (!(goldstein <= -2 || avgTone <= -1)) continue;
 
       countSeen++;
 
