@@ -228,9 +228,12 @@ export async function pollNewsAPI() {
     const from = new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
     const to = now.toISOString();
 
-    const url =
-      `${NEWS_API_URL}?q=${encodeURIComponent(hazardQuery)}` +
-      `&language=en&from=${from}&to=${to}&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
+   const sources = "the-weather-channel,associated-press,abc-news,nbc-news,fox-news,npr,bloomberg,usa-today";
+
+   const url =
+     `${NEWS_API_URL}?q=${encodeURIComponent(hazardQuery)}` +
+     `&sources=${sources}` +
+     `&language=en&from=${from}&to=${to}&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
 
     console.log("🔍 URL:", url);
 
