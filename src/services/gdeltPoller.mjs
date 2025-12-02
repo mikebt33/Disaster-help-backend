@@ -31,17 +31,21 @@ export async function pollGDELT() {
   console.log("🌎 GDELT Poller running…");
 
   try {
-    // 1) Get the latest update file (points to newest ZIP)
+    // 1) Get the latest update file (points to newest ZIPs)
     const { data: lastFileText } = await axios.get(LASTUPDATE_URL, {
       timeout: 15000,
       responseType: "text",
     });
 
     const lines = String(lastFileText).split(/\r?\n/).filter(Boolean);
-    const zipLine = lines.find((l) => l.includes(".export.CSV.zip"));
+
+    // Pick the EVENTS export file: YYYYMMDDHHMMSS.export.CSV.zip
+    const zipLine = lines.find((l) =>
+      l.match(/\/\d{14}\.export\.CSV\.zip$/i)
+    );
 
     if (!zipLine) {
-      console.warn("⚠️ GDELT: no .CSV.zip found.");
+      console.warn("⚠️ GDELT: no Events .export.CSV.zip found in lastupdate.txt");
       return;
     }
 
@@ -67,7 +71,7 @@ export async function pollGDELT() {
     }
 
     if (!csvStream) {
-      console.warn("⚠️ GDELT: no CSV found inside ZIP");
+      console.warn("⚠️ GDELT: no CSV entry found in ZIP");
       return;
     }
 
@@ -81,16 +85,29 @@ export async function pollGDELT() {
     let countMatched = 0;
     let countSaved = 0;
 
-    // -----------------------
-    // MAIN CSV LOOP
-    // -----------------------
     for await (const line of rl) {
       if (!line.trim()) continue;
 
       const cols = line.split("\t");
-      if (cols.length < 58) continue;
+      // GDELT 2.0 Events CSV has 61 columns (0–60)
+      if (cols.length < 61) {
+        // Not an Events row (could be malformed or another file type)
+        continue;
+      }
 
-      // Columns
+      // Column indices (GDELT 2.0 EVENTS)
+      //  1: SQLDATE
+      // 26: EventCode
+      // 27: EventBaseCode
+      // 28: EventRootCode
+      // 29: QuadClass
+      // 30: GoldsteinScale
+      // 34: AvgTone
+      // 52: ActionGeo_FullName
+      // 53: ActionGeo_CountryCode
+      // 56: ActionGeo_Lat
+      // 57: ActionGeo_Long
+      // 60: SOURCEURL
       const sqlDate = cols[1];
       const eventCode = cols[26];
       const eventBaseCode = cols[27];
@@ -99,14 +116,14 @@ export async function pollGDELT() {
       const goldstein = parseFloat(cols[30]);
       const avgTone = parseFloat(cols[34]);
 
-      const actionGeoFullName = cols[50];
-      const actionGeoCountry = cols[51];
-      const actionGeoLat = parseFloat(cols[53]);
-      const actionGeoLon = parseFloat(cols[54]);
-      const url = cols[57];
+      const actionGeoFullName = cols[52];
+      const actionGeoCountry = cols[53];
+      const actionGeoLat = parseFloat(cols[56]);
+      const actionGeoLon = parseFloat(cols[57]);
+      const url = cols[60];
 
       // --------------------
-      // DEBUG: first 20 rows
+      // DEBUG: first 20 raw rows
       // --------------------
       if (debugRawPrinted < 20) {
         console.log("GDELT RAW:", {
@@ -125,7 +142,7 @@ export async function pollGDELT() {
       }
 
       // --------------------------------------------
-      // FILTER #1 — U.S. detection (relaxed + correct)
+      // FILTER #1 — U.S. detection
       // --------------------------------------------
       const name = (actionGeoFullName || "").toLowerCase();
 
@@ -134,7 +151,7 @@ export async function pollGDELT() {
         name.includes("united states") ||
         name.includes("usa") ||
         name.match(
-          /\b(AK|AL|AR|AZ|CA|CO|CT|DC|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV)\b/i
+          /\b(AL|AK|AZ|AR|CA|CO|CT|DC|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV)\b/i
         );
 
       if (!isUS) continue;
@@ -145,11 +162,11 @@ export async function pollGDELT() {
       if (isNaN(actionGeoLat) || isNaN(actionGeoLon)) continue;
 
       // --------------------------------------------
-      // FILTER #3 — Negativity relaxed (debug mode)
+      // FILTER #3 — Negativity (relaxed but meaningful)
       // --------------------------------------------
+      // Debug stage: accept moderately negative or tense coverage.
       if (!(goldstein <= -1 || avgTone <= 0)) continue;
 
-      // At this point it is a "matched" US-negative event
       countMatched++;
 
       // --------------------------------------------
@@ -162,17 +179,12 @@ export async function pollGDELT() {
         url,
       });
 
-      // --------------------------------------------
-      // Require URL for de-duplication + display
-      // --------------------------------------------
+      // Require usable URL
       if (!url) continue;
 
       const publishedAt = parseGdeltDate(sqlDate);
       const domain = getDomain(url);
 
-      // --------------------------------------------
-      // Build Document
-      // --------------------------------------------
       const doc = {
         type: "news",
         source: "GDELT",
@@ -182,7 +194,7 @@ export async function pollGDELT() {
         description: `GDELT-coded event at ${actionGeoFullName || "unknown location"}`,
         publishedAt,
         createdAt: new Date(),
-        expires: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        expires: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24h TTL
 
         geometry: {
           type: "Point",
@@ -202,7 +214,6 @@ export async function pollGDELT() {
         },
       };
 
-      // Save
       await col.updateOne({ url }, { $set: doc }, { upsert: true });
       countSaved++;
     }
