@@ -180,23 +180,40 @@ cron.schedule("0 2 * * *", async () => {
   await runCleanup();
 });
 
-// CAP poller
-console.log("⏱️ Initial CAP feed poll on startup...");
-await pollCapFeeds();
+// ---------------------------------------------------------------------------
+// 🚫 REMOVE ALL top-level awaits for pollers
+//    They were blocking Express from binding the port.
+// ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ✅ Initial pollers — run AFTER server starts (non-blocking)
+// ---------------------------------------------------------------------------
+setTimeout(() => {
+  console.log("⏱️ Initial CAP feed poll (delayed)...");
+  pollCapFeeds();
+}, 5000);
+
+setTimeout(() => {
+  console.log("📰 Initial NewsAPI poll (delayed)...");
+  pollNewsAPI();
+}, 8000);
+
+setTimeout(() => {
+  console.log("🌎 Initial GDELT poll (delayed)...");
+  pollGDELT();
+}, 10000);
+
+// ---------------------------------------------------------------------------
+// ⏱️ Scheduled recurring pollers
+// ---------------------------------------------------------------------------
+
+// CAP poller every 5 minutes
 cron.schedule("*/5 * * * *", async () => {
   console.log("⏱️ Scheduled CAP alert ingestion running...");
   await pollCapFeeds();
 });
 
-// NEWS poller (initial + every 15 minutes)
-console.log("📰 Initial NewsAPI poll on startup...");
-await pollNewsAPI();
-
-// GDELT poller (initial + every 15 minutes)
-console.log("🌎 Initial GDELT poll on startup...");
-await pollGDELT();
-
+// News + GDELT every 15 minutes
 cron.schedule("*/15 * * * *", async () => {
   console.log("📰 Scheduled NewsAPI polling running...");
   await pollNewsAPI();
