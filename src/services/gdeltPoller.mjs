@@ -1,5 +1,6 @@
 // src/services/gdeltPoller.mjs
-// GDELT poller: ingests latest US negative/high-impact events into social_signals.
+// GDELT Poller — A2 Disaster/Weather-Only Mode
+// Produces clean, civilian-friendly quicksheet text.
 
 import axios from "axios";
 import unzipper from "unzipper";
@@ -8,57 +9,89 @@ import { getDB } from "../db.js";
 
 const LASTUPDATE_URL = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt";
 
-// Helper: parse GDELT SQLDATE (YYYYMMDD) → JS Date (UTC midnight)
+// ------------------ DISASTER KEYWORDS ------------------
+const DISASTER_KEYWORDS = [
+  "storm", "thunderstorm", "severe weather", "winter", "snow", "blizzard",
+  "ice", "freezing", "cold wave", "wind", "damaging wind",
+  "hurricane", "cyclone", "typhoon", "tropical storm",
+  "wildfire", "fire", "bushfire", "smoke", "air quality",
+  "flood", "flash flood", "flooding",
+  "landslide", "mudslide",
+  "earthquake", "aftershock", "seismic",
+  "eruption", "volcano",
+  "drought", "heat wave", "extreme heat",
+  "outage", "blackout", "power outage",
+  "explosion", "hazmat", "chemical", "toxic"
+];
+
+// ------------------ HAZARD CLASSIFIER ------------------
+function classifyHazard(text = "") {
+  const t = text.toLowerCase();
+
+  if (t.match(/wildfire|fire|bushfire|smoke/)) return "Wildfire activity";
+  if (t.match(/storm|thunderstorm|severe weather|wind/)) return "Severe storm activity";
+  if (t.match(/snow|winter|blizzard|ice|freezing/)) return "Winter storm conditions";
+  if (t.match(/flood|flash flood|flooding/)) return "Flooding impacts";
+  if (t.match(/earthquake|aftershock|seismic/)) return "Earthquake activity";
+  if (t.match(/landslide|mudslide/)) return "Landslide conditions";
+  if (t.match(/drought|heat wave|extreme heat/)) return "Extreme heat conditions";
+  if (t.match(/outage|blackout/)) return "Power outage";
+  if (t.match(/hazmat|chemical|toxic|explosion/)) return "Hazardous material incident";
+
+  return "Hazard conditions";
+}
+
+// ------------------ MAPPINGS ------------------
+const BLOCKED_DOMAINS = [
+  "tmz.com", "people.com", "variety.com", "hollywoodreporter.com", "geonews",
+  "perezhilton", "eonline.com", "buzzfeed.com", "usmagazine.com", "entertainment",
+];
+
+// Disaster root codes from GDELT taxonomy
+const DISASTER_ROOTS = new Set(["07","08","14","15","16","17","18","19","20"]);
+
+// Date parser
 function parseGdeltDate(sqlDate) {
   if (!sqlDate || sqlDate.length !== 8) return new Date();
-  const y = sqlDate.slice(0, 4);
-  const m = sqlDate.slice(4, 6);
-  const d = sqlDate.slice(6, 8);
-  return new Date(`${y}-${m}-${d}T00:00:00Z`);
+  return new Date(`${sqlDate.slice(0, 4)}-${sqlDate.slice(4, 6)}-${sqlDate.slice(6)}T00:00:00Z`);
 }
 
-// Helper: safely extract domain from URL
+// Domain extractor
 function getDomain(url) {
-  try {
-    const u = new URL(url);
-    return u.hostname.replace(/^www\./, "");
-  } catch {
-    return "";
-  }
+  try { return new URL(url).hostname.replace(/^www\./, ""); }
+  catch { return ""; }
 }
 
+// ------------------ MAIN POLLER ------------------
 export async function pollGDELT() {
-  console.log("🌎 GDELT Poller running…");
+  console.log("🌎 GDELT Poller running (Disaster-Only A2)…");
 
   try {
-    // 1) Get the latest update file (points to newest ZIPs)
-    const { data: lastFileText } = await axios.get(LASTUPDATE_URL, {
+    // --------- 1. Get latest events file ---------
+    const { data: lastFile } = await axios.get(LASTUPDATE_URL, {
       timeout: 15000,
       responseType: "text",
     });
 
-    const lines = String(lastFileText).split(/\r?\n/).filter(Boolean);
+    const lines = lastFile.split(/\r?\n/).filter(Boolean);
 
-    // Pick the EVENTS export file: YYYYMMDDHHMMSS.export.CSV.zip
-    const zipLine = lines.find((l) =>
-      l.match(/\/\d{14}\.export\.CSV\.zip$/i)
-    );
-
+    // Match correct EVENTS export ZIP
+    const zipLine = lines.find((l) => l.match(/\/\d{14}\.export\.CSV\.zip$/));
     if (!zipLine) {
-      console.warn("⚠️ GDELT: no Events .export.CSV.zip found in lastupdate.txt");
+      console.warn("⚠️ No valid events file found.");
       return;
     }
 
     const zipUrl = zipLine.trim().split(/\s+/).pop();
-    console.log("⬇️ GDELT downloading:", zipUrl);
+    console.log("⬇️ Downloading:", zipUrl);
 
-    // 2) Download ZIP
+    // --------- 2. Download ZIP ---------
     const zipResp = await axios.get(zipUrl, {
       responseType: "stream",
       timeout: 60000,
     });
 
-    // 3) Extract CSV from ZIP
+    // --------- 3. Extract CSV ---------
     const directory = zipResp.data.pipe(unzipper.Parse({ forceStream: true }));
     let csvStream = null;
 
@@ -71,161 +104,117 @@ export async function pollGDELT() {
     }
 
     if (!csvStream) {
-      console.warn("⚠️ GDELT: no CSV entry found in ZIP");
+      console.warn("⚠️ ZIP had no CSV.");
       return;
     }
 
-    console.log("📄 GDELT parsing CSV stream…");
+    console.log("📄 Parsing CSV…");
 
     const rl = readline.createInterface({ input: csvStream });
     const db = getDB();
     const col = db.collection("social_signals");
 
-    let debugRawPrinted = 0;
-    let countMatched = 0;
-    let countSaved = 0;
+    let debugPrinted = 0;
+    let matched = 0;
+    let saved = 0;
 
+    // ------------------ MAIN CSV LOOP ------------------
     for await (const line of rl) {
       if (!line.trim()) continue;
-
       const cols = line.split("\t");
-      // GDELT 2.0 Events CSV has 61 columns (0–60)
-      if (cols.length < 61) {
-        // Not an Events row (could be malformed or another file type)
-        continue;
-      }
 
-      // Column indices (GDELT 2.0 EVENTS)
-      //  1: SQLDATE
-      // 26: EventCode
-      // 27: EventBaseCode
-      // 28: EventRootCode
-      // 29: QuadClass
-      // 30: GoldsteinScale
-      // 34: AvgTone
-      // 52: ActionGeo_FullName
-      // 53: ActionGeo_CountryCode
-      // 56: ActionGeo_Lat
-      // 57: ActionGeo_Long
-      // 60: SOURCEURL
+      if (cols.length < 61) continue; // malformed or wrong file
+
+      // Column mapping for GDELT Events V2.0
       const sqlDate = cols[1];
-      const eventCode = cols[26];
-      const eventBaseCode = cols[27];
       const eventRootCode = cols[28];
-      const quadClass = cols[29];
       const goldstein = parseFloat(cols[30]);
       const avgTone = parseFloat(cols[34]);
-
-      const actionGeoFullName = cols[52];
-      const actionGeoCountry = cols[53];
-      const actionGeoLat = parseFloat(cols[56]);
-      const actionGeoLon = parseFloat(cols[57]);
+      const fullName = cols[52];
+      const country = cols[53];
+      const lat = parseFloat(cols[56]);
+      const lon = parseFloat(cols[57]);
       const url = cols[60];
 
-      // --------------------
-      // DEBUG: first 20 raw rows
-      // --------------------
-      if (debugRawPrinted < 20) {
-        console.log("GDELT RAW:", {
-          sqlDate,
-          eventCode,
-          eventRootCode,
-          goldstein,
-          avgTone,
-          url,
-          geoName: actionGeoFullName,
-          country: actionGeoCountry,
-          lat: actionGeoLat,
-          lon: actionGeoLon,
-        });
-        debugRawPrinted++;
+      // ---- Debug first 15 raw rows ----
+      if (debugPrinted < 15) {
+        console.log("RAW:", { sqlDate, fullName, country, root: eventRootCode, goldstein, avgTone, url, lat, lon });
+        debugPrinted++;
       }
 
-      // --------------------------------------------
-      // FILTER #1 — U.S. detection
-      // --------------------------------------------
-      const name = (actionGeoFullName || "").toLowerCase();
-
+      // ---------- FILTER 1: Must be US ----------
+      const name = (fullName || "").toLowerCase();
       const isUS =
-        actionGeoCountry === "US" ||
+        country === "US" ||
         name.includes("united states") ||
         name.includes("usa") ||
-        name.match(
-          /\b(AL|AK|AZ|AR|CA|CO|CT|DC|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV)\b/i
-        );
+        name.match(/\b(AL|AK|AZ|AR|CA|CO|CT|DC|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV)\b/i);
 
       if (!isUS) continue;
 
-      // --------------------------------------------
-      // FILTER #2 — Geometry required
-      // --------------------------------------------
-      if (isNaN(actionGeoLat) || isNaN(actionGeoLon)) continue;
+      // ---------- FILTER 2: Must have coordinates ----------
+      if (isNaN(lat) || isNaN(lon)) continue;
 
-      // --------------------------------------------
-      // FILTER #3 — Negativity (relaxed but meaningful)
-      // --------------------------------------------
-      // Debug stage: accept moderately negative or tense coverage.
-      if (!(goldstein <= -1 || avgTone <= 0)) continue;
-
-      countMatched++;
-
-      // --------------------------------------------
-      // DEBUG MATCH
-      // --------------------------------------------
-      console.log("GDELT MATCH:", {
-        loc: actionGeoFullName,
-        goldstein,
-        avgTone,
-        url,
-      });
-
-      // Require usable URL
+      // ---------- FILTER 3: Must have URL ----------
       if (!url) continue;
 
-      const publishedAt = parseGdeltDate(sqlDate);
       const domain = getDomain(url);
 
+      // ---------- FILTER 4: Block gossip ----------
+      if (BLOCKED_DOMAINS.some((b) => domain.includes(b))) continue;
+
+      // ---------- FILTER 5: Must be disaster root code ----------
+      if (!DISASTER_ROOTS.has(eventRootCode)) continue;
+
+      // ---------- FILTER 6: Keyword match ----------
+      const textLower = (fullName || "").toLowerCase();
+      const keywordHit = DISASTER_KEYWORDS.some((kw) => textLower.includes(kw));
+      if (!keywordHit) continue;
+
+      // ---------- FILTER 7: Negativity threshold ----------
+      if (!(goldstein <= -1 || avgTone <= 0)) continue;
+
+      matched++;
+
+      // ---------- CLASSIFY ----------
+      const hazard = classifyHazard(fullName);
+      const publishedAt = parseGdeltDate(sqlDate);
+
+      // ---------- HUMAN-FRIENDLY DOCUMENT ----------
       const doc = {
         type: "news",
         source: "GDELT",
         domain,
         url,
-        title: `${actionGeoFullName || "GDELT Event"} (${eventCode})`,
-        description: `GDELT-coded event at ${actionGeoFullName || "unknown location"}`,
+
+        title: `${hazard} near ${fullName || "Unknown Location"}`,
+        description: `${hazard} reported near ${fullName}.`,
+
         publishedAt,
         createdAt: new Date(),
-        expires: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24h TTL
+        expires: new Date(Date.now() + 24 * 60 * 60 * 1000),
 
         geometry: {
           type: "Point",
-          coordinates: [actionGeoLon, actionGeoLat],
+          coordinates: [lon, lat],
         },
         geometryMethod: "gdelt-action-geo",
 
         gdelt: {
           sqlDate,
-          eventCode,
-          eventBaseCode,
           eventRootCode,
-          quadClass,
           goldstein,
           avgTone,
-          locationText: actionGeoFullName,
+          fullName,
         },
       };
 
       await col.updateOne({ url }, { $set: doc }, { upsert: true });
-      countSaved++;
+      saved++;
     }
 
-    console.log(
-      `🌎 GDELT FINISHED: matched ${countMatched} US events, saved ${countSaved}.`
-    );
+    console.log(`🌎 GDELT DONE — Matched ${matched} disaster events, saved ${saved}.`);
   } catch (err) {
-    if (err.response) {
-      console.error("❌ GDELT HTTP error:", err.response.status, err.response.data);
-    } else {
-      console.error("❌ GDELT poll error:", err.message);
-    }
+    console.error("❌ GDELT ERROR:", err.message);
   }
 }
