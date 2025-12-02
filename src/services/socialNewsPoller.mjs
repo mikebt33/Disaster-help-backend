@@ -54,18 +54,10 @@ const STATE_NAMES = new Set(Object.keys(STATE_NAME_TO_CODE));
 
 // -------------------- Hazard keywords --------------------
 const HAZARD_WORDS = [
-  "flash flood", "storm surge", "hurricane", "tropical storm",
-  "tornado", "cyclone", "typhoon", "wildfire", "forest fire",
-  "earthquake", "aftershock", "tsunami", "volcano", "eruption",
-  "landslide", "mudslide", "blizzard", "heat wave", "heatwave",
-  "drought", "avalanche", "hailstorm", "dust storm", "severe weather",
-  "snowstorm", "ice storm", "power outage", "blackout", "floods",
-  "flooding",
-
-  // broadeners
-  "storm", "damaging winds", "heavy rain", "rainfall", "storm damage",
-  "winter storm", "extreme heat", "wind advisory", "weather warning",
-  "weather alert"
+  "flood", "flash flood", "storm", "severe weather", "tornado",
+  "hurricane", "tropical storm", "wildfire", "forest fire",
+  "earthquake", "tsunami", "landslide", "mudslide", "blizzard",
+  "winter storm", "power outage"
 ];
 
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
