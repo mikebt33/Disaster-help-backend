@@ -7,6 +7,10 @@
 //
 // All alerts are normalized into a common schema and saved into the
 // alerts_cap MongoDB collection with geometry + bbox for map rendering.
+//
+// Stacking fix:
+// - Uses STABLE (deterministic) jitter for all fallback point placements so markers
+//   don’t collapse into one spot (and don’t “jump” every poll).
 
 import axios from "axios";
 import { XMLParser } from "fast-xml-parser";
@@ -192,6 +196,64 @@ function extractStateAbbrs(text) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  STABLE JITTER (STACKING FIX)                                      */
+/* ------------------------------------------------------------------ */
+
+function hashStringToUint32(str) {
+  // FNV-1a
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function wrapLon(lon) {
+  let x = lon;
+  while (x > 180) x -= 360;
+  while (x < -180) x += 360;
+  return x;
+}
+
+function clampLat(lat) {
+  return Math.max(-89.9999, Math.min(89.9999, lat));
+}
+
+function stateJitterRadiusDeg(abbr) {
+  // Keep “near center mass” but spread enough to avoid stacks.
+  if (abbr === "AK") return 2.25;
+  if (abbr === "HI") return 0.5;
+  if (abbr === "DC") return 0.06;
+  if (["PR", "GU", "VI", "AS", "MP"].includes(abbr)) return 0.35;
+  return 0.45;
+}
+
+/**
+ * Deterministic jitter: same input → same output (no jumping per poll).
+ * maxDeg is approx radius in degrees (lat). Lon is scaled by cos(lat).
+ */
+function stableJitterCoords([lon, lat], seedStr, maxDeg = 0.25) {
+  const s = String(seedStr || "");
+  const h1 = hashStringToUint32(s);
+  const h2 = hashStringToUint32(s + "x");
+
+  const u = (h1 & 0xffffffff) / 0xffffffff;
+  const v = (h2 & 0xffffffff) / 0xffffffff;
+
+  const angle = 2 * Math.PI * u;
+  const radius = Math.sqrt(v) * maxDeg;
+
+  const dLat = radius * Math.sin(angle);
+  const cosLat = Math.max(0.25, Math.cos((lat * Math.PI) / 180));
+  const dLon = (radius * Math.cos(angle)) / cosLat;
+
+  const outLon = wrapLon(lon + dLon);
+  const outLat = clampLat(lat + dLat);
+  return [outLon, outLat];
+}
+
+/* ------------------------------------------------------------------ */
 /*  GEOMETRY HELPERS                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -356,10 +418,7 @@ function normalizeCountyName(raw) {
   s = s.replace(/^City of\s+/i, "");
 
   // Drop common county-type suffixes
-  s = s.replace(
-    /\s+(County|Parish|Borough|Census Area|Municipio|Municipality|City)$/i,
-    ""
-  );
+  s = s.replace(/\s+(County|Parish|Borough|Census Area|Municipio|Municipality|City)$/i, "");
 
   // Normalize St. → Saint
   s = s.replace(/^St[.\s]+/i, "Saint ");
@@ -463,6 +522,8 @@ function normalizeCapAlert(entry, feed) {
       entry.content?.["cap:alert"] ||
       entry;
 
+    const seedKey = String(root.identifier || root.id || root.guid || "");
+
     // Info block (for CAP-style alerts). For NWS CAP, most fields live directly on root.
     const infoRaw = root.info || root["cap:info"] || {};
     const info = Array.isArray(infoRaw) ? infoRaw[0] : infoRaw || {};
@@ -507,17 +568,10 @@ function normalizeCapAlert(entry, feed) {
 
     // 2) georss:point (usually precise)
     if (!geometry) {
-      const pointStr =
-        root.point ||
-        root["georss:point"] ||
-        info.point ||
-        info["georss:point"];
+      const pointStr = root.point || root["georss:point"] || info.point || info["georss:point"];
 
       if (typeof pointStr === "string") {
-        const parts = pointStr
-          .trim()
-          .split(/\s+/)
-          .map(Number);
+        const parts = pointStr.trim().split(/\s+/).map(Number);
         if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
           const [lat, lon] = parts;
           geometry = { type: "Point", coordinates: [lon, lat] };
@@ -536,7 +590,7 @@ function normalizeCapAlert(entry, feed) {
       }
     }
 
-    // 4) Multi-county centroid (legacy county-centroid behavior)
+    // 4) Multi-county centroid (legacy county-centroid behavior) + stable jitter
     if (!geometry && areaDesc && stateHint) {
       const regions = areaDesc
         .split(/[,;]+/)
@@ -550,45 +604,45 @@ function normalizeCapAlert(entry, feed) {
       }
 
       if (pts.length === 1) {
-        geometry = { type: "Point", coordinates: pts[0] };
-        geometryMethod = "county-fallback-single";
+        geometry = {
+          type: "Point",
+          coordinates: stableJitterCoords(pts[0], `${seedKey}|county1`, 0.12),
+        };
+        geometryMethod = "county-fallback-single-jitter";
       } else if (pts.length > 1) {
         const avgLon = pts.reduce((s, p) => s + p[0], 0) / pts.length;
         const avgLat = pts.reduce((s, p) => s + p[1], 0) / pts.length;
-        geometry = { type: "Point", coordinates: [avgLon, avgLat] };
-        geometryMethod = "county-fallback-multi-centroid";
+        geometry = {
+          type: "Point",
+          coordinates: stableJitterCoords([avgLon, avgLat], `${seedKey}|countym`, 0.15),
+        };
+        geometryMethod = "county-fallback-multi-centroid-jitter";
       }
     }
 
-    // 5) LAST fallback → state center (legacy behavior)
+    // 5) LAST fallback → state center + stable jitter (major stacking fix)
     if (!geometry) {
       let abbr = stateHint;
 
       // Only if NO stateHint exists, then try to guess from text.
       if (!abbr) {
-        const guessList = extractStateAbbrs(
-          areaDesc ||
-            info.headline ||
-            root.title ||
-            root.summary ||
-            ""
-        );
+        const guessList = extractStateAbbrs(areaDesc || info.headline || root.title || root.summary || "");
         abbr = guessList[0];
       }
 
       if (abbr && STATE_CENTERS[abbr]) {
-        geometry = { type: "Point", coordinates: STATE_CENTERS[abbr] };
-        geometryMethod = "state-center";
+        const maxDeg = stateJitterRadiusDeg(abbr);
+        geometry = {
+          type: "Point",
+          coordinates: stableJitterCoords(STATE_CENTERS[abbr], `${seedKey}|state|${abbr}`, maxDeg),
+        };
+        geometryMethod = "state-center-jitter";
       }
     }
 
     // --- Skip if still no valid geometry ---
     if (!geometry) {
-      console.warn(
-        `🚫 Skipping CAP alert with no usable geometry: ${
-          areaDesc || "(no areaDesc)"
-        }`
-      );
+      console.warn(`🚫 Skipping CAP alert with no usable geometry: ${areaDesc || "(no areaDesc)"}`);
       return null;
     }
 
@@ -609,9 +663,7 @@ function normalizeCapAlert(entry, feed) {
         expires = parsed;
       } else {
         console.warn(
-          `⚠️ Invalid expires format, fallback 1h TTL for ${
-            root?.identifier || "(unknown)"
-          }`
+          `⚠️ Invalid expires format, fallback 1h TTL for ${root?.identifier || "(unknown)"}`
         );
         expires = new Date(Date.now() + 60 * 60 * 1000);
       }
@@ -649,8 +701,7 @@ function normalizeCapAlert(entry, feed) {
       }
     }
 
-    const headlineText =
-      info.headline || root.title || root.summary || eventName;
+    const headlineText = info.headline || root.title || root.summary || eventName;
 
     // --- Description cleanup ---
     let descriptionText = info.description || root.summary || root.content || "";
@@ -699,12 +750,7 @@ function normalizeCapAlert(entry, feed) {
     return {
       identifier: root.identifier || root.id || `UNKNOWN-${Date.now()}`,
       sender: root.sender || "",
-      sent:
-        info.effective ||
-        root.sent ||
-        root.updated ||
-        root.published ||
-        new Date().toISOString(),
+      sent: info.effective || root.sent || root.updated || root.published || new Date().toISOString(),
       status: root.status || "Actual",
       msgType: root.msgType || "Alert",
       scope: root.scope || "Public",
@@ -770,6 +816,14 @@ function normalizeNoaaAlert(feature) {
     const areaDesc = props.areaDesc || "";
     const stateHint = detectStateHintFromNoaa(props);
 
+    // Compute a stable seed early (prevents jitter jump)
+    const seedKey =
+      String(
+        props.id ||
+          (typeof props["@id"] === "string" ? props["@id"] : "") ||
+          (typeof feature.id === "string" ? feature.id : "")
+      ) || `NOAA-SEED-${Date.now()}`;
+
     // --- Geometry from NOAA GeoJSON geometry (preferred) ---
     let geometry = null;
     let geometryMethod = null;
@@ -779,36 +833,37 @@ function normalizeNoaaAlert(feature) {
     if (pts.length) {
       geometry = pointsCentroid(pts);
       bbox = bboxFromPoints(pts);
-      geometryMethod = `noaa-${feature.geometry.type || "geom"}`.toLowerCase();
+      geometryMethod = `noaa-${(feature.geometry?.type || "geom")}`.toLowerCase();
     }
 
-    // --- County-level fallback (legacy behavior) ---
+    // --- County-level fallback (legacy behavior) + stable jitter ---
     if (!geometry && areaDesc) {
       const countyGeom = tryCountyCenterFromAreaDesc(areaDesc, stateHint);
-      if (countyGeom) {
-        geometry = countyGeom;
-        geometryMethod = "noaa-county-fallback";
+      if (countyGeom?.type === "Point" && Array.isArray(countyGeom.coordinates)) {
+        geometry = {
+          type: "Point",
+          coordinates: stableJitterCoords(countyGeom.coordinates, `${seedKey}|noaa|county`, 0.12),
+        };
+        geometryMethod = "noaa-county-fallback-jitter";
       }
     }
 
-    // --- State-center fallback ---
+    // --- State-center fallback (major stacking fix) + stable jitter ---
     if (!geometry) {
       let abbr = stateHint;
 
       if (!abbr) {
-        const guessList = extractStateAbbrs(
-          areaDesc ||
-            props.headline ||
-            props.description ||
-            props.event ||
-            ""
-        );
+        const guessList = extractStateAbbrs(areaDesc || props.headline || props.description || props.event || "");
         abbr = guessList[0];
       }
 
       if (abbr && STATE_CENTERS[abbr]) {
-        geometry = { type: "Point", coordinates: STATE_CENTERS[abbr] };
-        geometryMethod = "noaa-state-center";
+        const maxDeg = stateJitterRadiusDeg(abbr);
+        geometry = {
+          type: "Point",
+          coordinates: stableJitterCoords(STATE_CENTERS[abbr], `${seedKey}|noaa|state|${abbr}`, maxDeg),
+        };
+        geometryMethod = "noaa-state-center-jitter";
       }
     }
 
@@ -820,8 +875,7 @@ function normalizeNoaaAlert(feature) {
     // --- Identifier / timing ---
     const identifier =
       props.id ||
-      (typeof props["@id"] === "string" &&
-      props["@id"].includes("/")
+      (typeof props["@id"] === "string" && props["@id"].includes("/")
         ? props["@id"].split("/").pop()
         : props["@id"]) ||
       (typeof feature.id === "string" && feature.id.includes("/")
@@ -829,29 +883,18 @@ function normalizeNoaaAlert(feature) {
         : feature.id) ||
       `NOAA-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    const sent =
-      props.effective ||
-      props.onset ||
-      props.sent ||
-      props.updated ||
-      new Date().toISOString();
+    const sent = props.effective || props.onset || props.sent || props.updated || new Date().toISOString();
 
     let expires = null;
     if (props.expires) {
       const parsed = new Date(props.expires);
-      expires = isNaN(parsed.getTime())
-        ? new Date(Date.now() + 60 * 60 * 1000)
-        : parsed;
+      expires = isNaN(parsed.getTime()) ? new Date(Date.now() + 60 * 60 * 1000) : parsed;
     } else {
       expires = new Date(Date.now() + 60 * 60 * 1000);
     }
 
     // --- Text fields ---
-    let eventName =
-      props.event ||
-      (props.headline && props.headline.split(" issued")[0]) ||
-      "Alert";
-
+    let eventName = props.event || (props.headline && props.headline.split(" issued")[0]) || "Alert";
     const headlineText = props.headline || eventName;
 
     let descriptionText = props.description || "";
@@ -924,21 +967,17 @@ async function saveAlerts(alerts) {
   try {
     const db = getDB();
     const collection = db.collection("alerts_cap");
-    const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000);
+    const cutoffIso = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
 
-    // Clean out very old alerts (safety net; TTL index also exists)
-    await collection.deleteMany({ sent: { $lt: cutoff } });
+    // Clean out very old alerts (string ISO compare is safe lexicographically)
+    await collection.deleteMany({ sent: { $lt: cutoffIso } });
 
     for (const alert of alerts) {
       const doc = { ...alert };
       if (alert.geometry) doc.geometry = alert.geometry;
       if (alert.bbox) doc.bbox = alert.bbox;
 
-      await collection.updateOne(
-        { identifier: alert.identifier },
-        { $set: doc },
-        { upsert: true }
-      );
+      await collection.updateOne({ identifier: alert.identifier }, { $set: doc }, { upsert: true });
     }
     console.log(`💾 Saved ${alerts.length} alerts to MongoDB`);
   } catch (err) {
@@ -972,9 +1011,7 @@ async function fetchCapFeed(feed) {
 
     const alerts = entries.map((e) => normalizeCapAlert(e, feed)).filter(Boolean);
     const usable = alerts.filter((a) => a.hasGeometry).length;
-    console.log(
-      `✅ Parsed ${alerts.length} alerts from ${feed.source} (${usable} usable geo)`
-    );
+    console.log(`✅ Parsed ${alerts.length} alerts from ${feed.source} (${usable} usable geo)`);
     if (alerts.length) await saveAlerts(alerts);
   } catch (err) {
     console.error(`❌ Error fetching ${feed.name}:`, err.message);
@@ -1001,20 +1038,22 @@ async function fetchNoaaAlerts() {
 
     for (const feature of features) {
       const alert = normalizeNoaaAlert(feature);
-      if (alert) {
-        alerts.push(alert);
-      } else {
-        skipped++;
-      }
+      if (alert) alerts.push(alert);
+      else skipped++;
     }
 
-    console.log(
-      `✅ NOAA parsed ${alerts.length} alerts (${features.length} raw, ${skipped} skipped)`
-    );
-
+    console.log(`✅ NOAA parsed ${alerts.length} alerts (${features.length} raw, ${skipped} skipped)`);
     if (alerts.length) await saveAlerts(alerts);
   } catch (err) {
-    console.error("❌ Error fetching NOAA alerts:", err.message);
+    // Helpful logging for common NOAA failures (403/429)
+    if (err?.response) {
+      console.error(
+        `❌ Error fetching NOAA alerts: ${err.response.status} ${err.response.statusText}`,
+        err.response.data?.detail ? `— ${err.response.data.detail}` : ""
+      );
+    } else {
+      console.error("❌ Error fetching NOAA alerts:", err.message);
+    }
   }
 }
 
@@ -1033,11 +1072,7 @@ async function pollCapFeeds() {
 
     // Delete expired or malformed alerts
     const { deletedCount } = await collection.deleteMany({
-      $or: [
-        { expires: { $lte: now } },
-        { expires: { $exists: false } },
-        { expires: null },
-      ],
+      $or: [{ expires: { $lte: now } }, { expires: { $exists: false } }, { expires: null }],
     });
 
     if (deletedCount > 0) {
