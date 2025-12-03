@@ -13,6 +13,8 @@
 // 1) Prevent NaN point coordinates from ever hitting Mongo 2dsphere index
 // 2) Save is resilient per alert (one bad doc won't block all others)
 // 3) Wide jitter in miles for state-center fallback to reduce marker stacking
+// 4) For CAP (FEMA/USGS), use county & geocode (FIPS/UGC) fallbacks instead of
+//    always jumping straight to state-centroid jitter.
 
 import axios from "axios";
 import { XMLParser } from "fast-xml-parser";
@@ -25,6 +27,37 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const countyCentersPath = path.resolve(__dirname, "../data/county_centers.json");
 const countyCenters = JSON.parse(fs.readFileSync(countyCentersPath, "utf8"));
+
+// Optional: centers from FIPS/UGC codes for FEMA CAP
+const fipsCentersPath = path.resolve(__dirname, "../data/fips_centers.json");
+let fipsCenters = {};
+try {
+  if (fs.existsSync(fipsCentersPath)) {
+    fipsCenters = JSON.parse(fs.readFileSync(fipsCentersPath, "utf8"));
+  } else {
+    console.warn(
+      "ℹ️ fips_centers.json not found; CAP FIPS geocodes will fall back to counties/state."
+    );
+  }
+} catch (err) {
+  console.warn("⚠️ Failed to load fips_centers.json:", err.message);
+  fipsCenters = {};
+}
+
+const ugcCentersPath = path.resolve(__dirname, "../data/ugc_centers.json");
+let ugcCenters = {};
+try {
+  if (fs.existsSync(ugcCentersPath)) {
+    ugcCenters = JSON.parse(fs.readFileSync(ugcCentersPath, "utf8"));
+  } else {
+    console.warn(
+      "ℹ️ ugc_centers.json not found; CAP UGC geocodes will fall back to counties/state."
+    );
+  }
+} catch (err) {
+  console.warn("⚠️ Failed to load ugc_centers.json:", err.message);
+  ugcCenters = {};
+}
 
 /* ------------------------------------------------------------------ */
 /*  CONFIG                                                            */
@@ -68,47 +101,138 @@ const CAP_FEEDS = [
  *  - ALERT_JITTER_COUNTY_MIN_MILES=4
  *  - ALERT_JITTER_COUNTY_MAX_MILES=12
  */
-const GEO_JITTER_ENABLED = String(process.env.ALERT_GEO_JITTER ?? "true").toLowerCase() !== "false";
-const JITTER_STATE_MIN_MILES = safeNumber(process.env.ALERT_JITTER_STATE_MIN_MILES, 20);
-const JITTER_STATE_MAX_MILES = safeNumber(process.env.ALERT_JITTER_STATE_MAX_MILES, 50);
-const JITTER_COUNTY_MIN_MILES = safeNumber(process.env.ALERT_JITTER_COUNTY_MIN_MILES, 4);
-const JITTER_COUNTY_MAX_MILES = safeNumber(process.env.ALERT_JITTER_COUNTY_MAX_MILES, 12);
+const GEO_JITTER_ENABLED =
+  String(process.env.ALERT_GEO_JITTER ?? "true").toLowerCase() !== "false";
+const JITTER_STATE_MIN_MILES = safeNumber(
+  process.env.ALERT_JITTER_STATE_MIN_MILES,
+  20
+);
+const JITTER_STATE_MAX_MILES = safeNumber(
+  process.env.ALERT_JITTER_STATE_MAX_MILES,
+  50
+);
+const JITTER_COUNTY_MIN_MILES = safeNumber(
+  process.env.ALERT_JITTER_COUNTY_MIN_MILES,
+  4
+);
+const JITTER_COUNTY_MAX_MILES = safeNumber(
+  process.env.ALERT_JITTER_COUNTY_MAX_MILES,
+  12
+);
 
 /** Fallback centers for state-level alerts (lon, lat) */
 const STATE_CENTERS = {
-  FL: [-81.5158, 27.6648], TX: [-99.9018, 31.9686], CA: [-119.4179, 36.7783],
-  NY: [-75.4999, 43.0003], NC: [-79.0193, 35.7596], VA: [-78.6569, 37.4316],
-  GA: [-83.4412, 32.1656], AL: [-86.9023, 32.8067], OH: [-82.9071, 40.4173],
-  PA: [-77.1945, 41.2033], MI: [-84.5361, 44.1822], LA: [-91.9623, 30.9843],
-  IL: [-89.3985, 40.6331], IN: [-86.1349, 40.2672], SC: [-81.1637, 33.8361],
-  KY: [-84.27, 37.8393], TN: [-86.5804, 35.5175], AR: [-92.3731, 34.9697],
-  AZ: [-111.0937, 34.0489], CO: [-105.7821, 39.5501], WA: [-120.7401, 47.7511],
-  OR: [-120.5542, 43.8041], NV: [-116.4194, 38.8026], OK: [-97.0929, 35.0078],
-  MO: [-91.8318, 38.5739], WI: [-89.6165, 44.7863], MN: [-94.6859, 46.7296],
-  IA: [-93.0977, 41.878], KS: [-98.4842, 39.0119], ME: [-69.4455, 45.2538],
-  VT: [-72.5778, 44.5588], NH: [-71.5724, 43.1939], MA: [-71.3824, 42.4072],
-  CT: [-72.6979, 41.6032], RI: [-71.4774, 41.5801], DE: [-75.5277, 38.9108],
-  MD: [-76.6413, 39.0458], WV: [-80.4549, 38.5976], ND: [-100.5407, 47.5515],
-  SD: [-99.9018, 43.9695], MT: [-110.3626, 46.8797], NE: [-99.9018, 41.4925],
-  NM: [-105.8701, 34.5199], WY: [-107.2903, 43.0759], ID: [-114.742, 44.0682],
-  UT: [-111.0937, 39.32], AK: [-152.4044, 64.2008], HI: [-155.5828, 19.8968],
-  PR: [-66.5901, 18.2208], GU: [144.7937, 13.4443], VI: [-64.8963, 18.3358],
+  FL: [-81.5158, 27.6648],
+  TX: [-99.9018, 31.9686],
+  CA: [-119.4179, 36.7783],
+  NY: [-75.4999, 43.0003],
+  NC: [-79.0193, 35.7596],
+  VA: [-78.6569, 37.4316],
+  GA: [-83.4412, 32.1656],
+  AL: [-86.9023, 32.8067],
+  OH: [-82.9071, 40.4173],
+  PA: [-77.1945, 41.2033],
+  MI: [-84.5361, 44.1822],
+  LA: [-91.9623, 30.9843],
+  IL: [-89.3985, 40.6331],
+  IN: [-86.1349, 40.2672],
+  SC: [-81.1637, 33.8361],
+  KY: [-84.27, 37.8393],
+  TN: [-86.5804, 35.5175],
+  AR: [-92.3731, 34.9697],
+  AZ: [-111.0937, 34.0489],
+  CO: [-105.7821, 39.5501],
+  WA: [-120.7401, 47.7511],
+  OR: [-120.5542, 43.8041],
+  NV: [-116.4194, 38.8026],
+  OK: [-97.0929, 35.0078],
+  MO: [-91.8318, 38.5739],
+  WI: [-89.6165, 44.7863],
+  MN: [-94.6859, 46.7296],
+  IA: [-93.0977, 41.878],
+  KS: [-98.4842, 39.0119],
+  ME: [-69.4455, 45.2538],
+  VT: [-72.5778, 44.5588],
+  NH: [-71.5724, 43.1939],
+  MA: [-71.3824, 42.4072],
+  CT: [-72.6979, 41.6032],
+  RI: [-71.4774, 41.5801],
+  DE: [-75.5277, 38.9108],
+  MD: [-76.6413, 39.0458],
+  WV: [-80.4549, 38.5976],
+  ND: [-100.5407, 47.5515],
+  SD: [-99.9018, 43.9695],
+  MT: [-110.3626, 46.8797],
+  NE: [-99.9018, 41.4925],
+  NM: [-105.8701, 34.5199],
+  WY: [-107.2903, 43.0759],
+  ID: [-114.742, 44.0682],
+  UT: [-111.0937, 39.32],
+  AK: [-152.4044, 64.2008],
+  HI: [-155.5828, 19.8968],
+  PR: [-66.5901, 18.2208],
+  GU: [144.7937, 13.4443],
+  VI: [-64.8963, 18.3358],
   DC: [-77.0369, 38.9072],
 };
 
 const STATE_NAME_TO_ABBR = {
-  Alabama: "AL", Alaska: "AK", Arizona: "AZ", Arkansas: "AR", California: "CA",
-  Colorado: "CO", Connecticut: "CT", Delaware: "DE", Florida: "FL", Georgia: "GA",
-  Hawaii: "HI", Idaho: "ID", Illinois: "IL", Indiana: "IN", Iowa: "IA",
-  Kansas: "KS", Kentucky: "KY", Louisiana: "LA", Maine: "ME", Maryland: "MD",
-  Massachusetts: "MA", Michigan: "MI", Minnesota: "MN", Mississippi: "MS", Missouri: "MO",
-  Montana: "MT", Nebraska: "NE", Nevada: "NV", "New Hampshire": "NH", "New Jersey": "NJ",
-  "New Mexico": "NM", "New York": "NY", "North Carolina": "NC", "North Dakota": "ND",
-  Ohio: "OH", Oklahoma: "OK", Oregon: "OR", Pennsylvania: "PA", "Rhode Island": "RI",
-  "South Carolina": "SC", "South Dakota": "SD", Tennessee: "TN", Texas: "TX", Utah: "UT",
-  Vermont: "VT", Virginia: "VA", Washington: "WA", "West Virginia": "WV", Wisconsin: "WI",
-  Wyoming: "WY", "District of Columbia": "DC", "Puerto Rico": "PR", Guam: "GU",
-  "U.S. Virgin Islands": "VI", "US Virgin Islands": "VI", "American Samoa": "AS",
+  Alabama: "AL",
+  Alaska: "AK",
+  Arizona: "AZ",
+  Arkansas: "AR",
+  California: "CA",
+  Colorado: "CO",
+  Connecticut: "CT",
+  Delaware: "DE",
+  Florida: "FL",
+  Georgia: "GA",
+  Hawaii: "HI",
+  Idaho: "ID",
+  Illinois: "IL",
+  Indiana: "IN",
+  Iowa: "IA",
+  Kansas: "KS",
+  Kentucky: "KY",
+  Louisiana: "LA",
+  Maine: "ME",
+  Maryland: "MD",
+  Massachusetts: "MA",
+  Michigan: "MI",
+  Minnesota: "MN",
+  Mississippi: "MS",
+  Missouri: "MO",
+  Montana: "MT",
+  Nebraska: "NE",
+  Nevada: "NV",
+  "New Hampshire": "NH",
+  "New Jersey": "NJ",
+  "New Mexico": "NM",
+  "New York": "NY",
+  "North Carolina": "NC",
+  "North Dakota": "ND",
+  Ohio: "OH",
+  Oklahoma: "OK",
+  Oregon: "OR",
+  Pennsylvania: "PA",
+  "Rhode Island": "RI",
+  "South Carolina": "SC",
+  "South Dakota": "SD",
+  Tennessee: "TN",
+  Texas: "TX",
+  Utah: "UT",
+  Vermont: "VT",
+  Virginia: "VA",
+  Washington: "WA",
+  "West Virginia": "WV",
+  Wisconsin: "WI",
+  Wyoming: "WY",
+  "District of Columbia": "DC",
+  "Puerto Rico": "PR",
+  Guam: "GU",
+  "U.S. Virgin Islands": "VI",
+  "US Virgin Islands": "VI",
+  "American Samoa": "AS",
   "Northern Mariana Islands": "MP",
 };
 
@@ -140,7 +264,8 @@ function isFiniteLonLat(lon, lat) {
 }
 
 function sanitizePointGeometry(geom) {
-  if (!geom || geom.type !== "Point" || !Array.isArray(geom.coordinates)) return null;
+  if (!geom || geom.type !== "Point" || !Array.isArray(geom.coordinates))
+    return null;
   const [lon, lat] = geom.coordinates;
   if (!isFiniteLonLat(lon, lat)) return null;
   return { type: "Point", coordinates: [wrapLon(lon), lat] };
@@ -187,7 +312,9 @@ function jitterLonLatMiles([lon, lat], seedStr, minMiles, maxMiles) {
   const v = rand();
 
   // Uniform by area in annulus
-  const r = Math.sqrt(minM * minM + u * (maxM * maxM - minM * minM)); // miles
+  const r = Math.sqrt(
+    minM * minM + u * (maxM * maxM - minM * minM)
+  ); // miles
   const theta = v * 2 * Math.PI;
 
   // Miles north/east
@@ -220,7 +347,9 @@ function maybeApplyJitter(pointGeom, geometryMethod, identifier) {
   const isStateFallback =
     method.includes("state-center") || method.includes("states-centroid");
   const isCountyFallback =
-    method.includes("county-fallback") || method.includes("county-centroid") || method.includes("county");
+    method.includes("county-fallback") ||
+    method.includes("county-centroid") ||
+    method.includes("county");
 
   if (!isStateFallback && !isCountyFallback) {
     return { geometry: g, geometryMethod };
@@ -231,8 +360,18 @@ function maybeApplyJitter(pointGeom, geometryMethod, identifier) {
   const [lon, lat] = g.coordinates;
 
   const [jLon, jLat] = isStateFallback
-    ? jitterLonLatMiles([lon, lat], seedStr, JITTER_STATE_MIN_MILES, JITTER_STATE_MAX_MILES)
-    : jitterLonLatMiles([lon, lat], seedStr, JITTER_COUNTY_MIN_MILES, JITTER_COUNTY_MAX_MILES);
+    ? jitterLonLatMiles(
+        [lon, lat],
+        seedStr,
+        JITTER_STATE_MIN_MILES,
+        JITTER_STATE_MAX_MILES
+      )
+    : jitterLonLatMiles(
+        [lon, lat],
+        seedStr,
+        JITTER_COUNTY_MIN_MILES,
+        JITTER_COUNTY_MAX_MILES
+      );
 
   const out = { type: "Point", coordinates: [jLon, jLat] };
   const outSan = sanitizePointGeometry(out);
@@ -289,9 +428,16 @@ const medianAbs = (arr) => {
 };
 
 function detectLonLatOrder(pairs) {
-  const aOutsideLat = pairs.reduce((c, [a]) => c + (Math.abs(a) > 90 ? 1 : 0), 0);
-  const bOutsideLat = pairs.reduce((c, [, b]) => c + (Math.abs(b) > 90 ? 1 : 0), 0);
-  if (aOutsideLat !== bOutsideLat) return aOutsideLat > bOutsideLat ? "lonlat" : "latlon";
+  const aOutsideLat = pairs.reduce(
+    (c, [a]) => c + (Math.abs(a) > 90 ? 1 : 0),
+    0
+  );
+  const bOutsideLat = pairs.reduce(
+    (c, [, b]) => c + (Math.abs(b) > 90 ? 1 : 0),
+    0
+  );
+  if (aOutsideLat !== bOutsideLat)
+    return aOutsideLat > bOutsideLat ? "lonlat" : "latlon";
   const aMed = medianAbs(pairs.map(([a]) => a));
   const bMed = medianAbs(pairs.map(([, b]) => b));
   return aMed - bMed > bMed - aMed ? "lonlat" : "latlon";
@@ -315,12 +461,15 @@ function parsePolygon(polygonString) {
         .split(/\s+/)
         .map(Number)
         .filter((x) => !isNaN(x));
-      for (let i = 0; i + 1 < nums.length; i += 2) rawPairs.push([nums[i], nums[i + 1]]);
+      for (let i = 0; i + 1 < nums.length; i += 2)
+        rawPairs.push([nums[i], nums[i + 1]]);
     }
     rawPairs = rawPairs.filter(([a, b]) => !isNaN(a) && !isNaN(b));
     if (rawPairs.length < 3) return null;
     const order = detectLonLatOrder(rawPairs);
-    const coords = rawPairs.map(([a, b]) => (order === "latlon" ? [b, a] : [a, b]));
+    const coords = rawPairs.map(([a, b]) =>
+      order === "latlon" ? [b, a] : [a, b]
+    );
     const [firstLon, firstLat] = coords[0];
     const [lastLon, lastLat] = coords[coords.length - 1];
     if (firstLon !== lastLon || firstLat !== lastLat) coords.push(coords[0]);
@@ -333,7 +482,9 @@ function parsePolygon(polygonString) {
 
 function pointsCentroid(pts) {
   if (!pts || !pts.length) return null;
-  let x = 0, y = 0, z = 0;
+  let x = 0,
+    y = 0,
+    z = 0;
 
   for (const [lon, lat] of pts) {
     if (!isFiniteLonLat(lon, lat)) continue;
@@ -347,13 +498,18 @@ function pointsCentroid(pts) {
   const total = pts.length;
   if (!total) return null;
 
-  x /= total; y /= total; z /= total;
+  x /= total;
+  y /= total;
+  z /= total;
 
   const lon = Math.atan2(y, x);
   const hyp = Math.sqrt(x * x + y * y);
   const lat = Math.atan2(z, hyp);
 
-  const out = { type: "Point", coordinates: [lon * (180 / Math.PI), lat * (180 / Math.PI)] };
+  const out = {
+    type: "Point",
+    coordinates: [lon * (180 / Math.PI), lat * (180 / Math.PI)],
+  };
   return sanitizePointGeometry(out);
 }
 
@@ -363,18 +519,32 @@ function polygonCentroid(geometry) {
 }
 
 function bboxFromPoints(points) {
-  const pts = (points || []).filter((p) => Array.isArray(p) && p.length >= 2 && isFiniteLonLat(p[0], p[1]));
+  const pts = (points || []).filter(
+    (p) =>
+      Array.isArray(p) &&
+      p.length >= 2 &&
+      isFiniteLonLat(p[0], p[1])
+  );
   if (!pts.length) return null;
   const lons = pts.map((p) => p[0]);
   const lats = pts.map((p) => p[1]);
-  return [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)];
+  return [
+    Math.min(...lons),
+    Math.min(...lats),
+    Math.max(...lons),
+    Math.max(...lats),
+  ];
 }
 
 function flattenNoaaGeometryPoints(geometry) {
   if (!geometry || !geometry.coordinates) return [];
   const { type, coordinates } = geometry;
 
-  const fin2 = (p) => Array.isArray(p) && p.length >= 2 && Number.isFinite(p[0]) && Number.isFinite(p[1]);
+  const fin2 = (p) =>
+    Array.isArray(p) &&
+    p.length >= 2 &&
+    Number.isFinite(p[0]) &&
+    Number.isFinite(p[1]);
 
   if (type === "Point") return fin2(coordinates) ? [coordinates] : [];
 
@@ -390,14 +560,17 @@ function flattenNoaaGeometryPoints(geometry) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  COUNTY HELPERS                                                    */
+/*  COUNTY / GEOCODE HELPERS                                          */
 /* ------------------------------------------------------------------ */
 
 function normalizeCountyName(raw) {
   if (!raw) return "";
   let s = String(raw).trim();
   s = s.replace(/^City of\s+/i, "");
-  s = s.replace(/\s+(County|Parish|Borough|Census Area|Municipio|Municipality|City)$/i, "");
+  s = s.replace(
+    /\s+(County|Parish|Borough|Census Area|Municipio|Municipality|City)$/i,
+    ""
+  );
   s = s.replace(/^St[.\s]+/i, "Saint ");
   s = s.replace(/\./g, "").replace(/\s+/g, " ").trim();
   return s;
@@ -412,10 +585,12 @@ function getCountyCenter(stateAbbr, countyRaw) {
 
   if (stateMap[norm]) return stateMap[norm];
 
-  const stripped = norm.replace(
-    /^(Eastern|Western|Northern|Southern|Central|Coastal|Upper|Lower|Northeast|Northwest|Southeast|Southwest)\s+/i,
-    ""
-  ).trim();
+  const stripped = norm
+    .replace(
+      /^(Eastern|Western|Northern|Southern|Central|Coastal|Upper|Lower|Northeast|Northwest|Southeast|Southwest)\s+/i,
+      ""
+    )
+    .trim();
 
   if (stripped && stateMap[stripped]) return stateMap[stripped];
 
@@ -426,7 +601,7 @@ function collectCountyCentersFromAreaDesc(areaDesc, stateHint) {
   if (!areaDesc) return [];
 
   const regions = String(areaDesc)
-    .split(/[;]+/) // NWS areaDesc is usually semicolon-separated
+    .split(/[;]+/) // NWS / CAP areaDesc is usually semicolon-separated
     .map((s) => s.trim())
     .filter(Boolean);
 
@@ -466,6 +641,38 @@ function tryCountyCenterFromAreaDesc(areaDesc, stateHint) {
   if (pts.length === 1) return { type: "Point", coordinates: pts[0] };
   const centroid = pointsCentroid(pts);
   return centroid;
+}
+
+/**
+ * Centers from FIPS / UGC codes (FEMA CAP geocodes).
+ * Uses fips_centers.json and ugc_centers.json if present.
+ */
+function centersFromFipsAndUgc(fipsCodes = [], ugcCodes = []) {
+  const pts = [];
+
+  for (const code of fipsCodes) {
+    const p = fipsCenters?.[code];
+    if (
+      Array.isArray(p) &&
+      p.length >= 2 &&
+      isFiniteLonLat(p[0], p[1])
+    ) {
+      pts.push(p);
+    }
+  }
+
+  for (const code of ugcCodes) {
+    const p = ugcCenters?.[code];
+    if (
+      Array.isArray(p) &&
+      p.length >= 2 &&
+      isFiniteLonLat(p[0], p[1])
+    ) {
+      pts.push(p);
+    }
+  }
+
+  return pts;
 }
 
 /* ------------------------------------------------------------------ */
@@ -508,6 +715,30 @@ function normalizeCapAlert(entry, feed) {
       root["cap:areaDesc"] ||
       "";
 
+    // CAP geocodes (FIPS / UGC / SAME etc.)
+    const geocodeRaw =
+      area.geocode ||
+      area["cap:geocode"] ||
+      info.geocode ||
+      info["cap:geocode"] ||
+      [];
+    const geocodes = Array.isArray(geocodeRaw) ? geocodeRaw : [geocodeRaw];
+
+    const fipsCodes = [];
+    const ugcCodes = [];
+    for (const gc of geocodes) {
+      if (!gc) continue;
+      const valueName =
+        gc.valueName || gc["cap:valueName"] || gc["@_valueName"] || "";
+      const value =
+        gc.value || gc["cap:value"] || gc["@_value"] || "";
+      if (!valueName || !value) continue;
+
+      const codes = String(value).trim().split(/\s+/);
+      if (/FIPS/i.test(valueName)) fipsCodes.push(...codes);
+      if (/UGC/i.test(valueName)) ugcCodes.push(...codes);
+    }
+
     let polygonRaw =
       area.polygon ||
       area["cap:polygon"] ||
@@ -531,12 +762,26 @@ function normalizeCapAlert(entry, feed) {
 
     // 2) georss:point (USGS Atom uses this often)
     if (!geometry) {
-      const pointStr = root.point || root["georss:point"] || info.point || info["georss:point"];
+      const pointStr =
+        root.point ||
+        root["georss:point"] ||
+        info.point ||
+        info["georss:point"];
       if (typeof pointStr === "string") {
-        const parts = pointStr.trim().split(/\s+/).map(Number);
-        if (parts.length >= 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1])) {
+        const parts = pointStr
+          .trim()
+          .split(/\s+/)
+          .map(Number);
+        if (
+          parts.length >= 2 &&
+          Number.isFinite(parts[0]) &&
+          Number.isFinite(parts[1])
+        ) {
           const [lat, lon] = parts;
-          geometry = sanitizePointGeometry({ type: "Point", coordinates: [lon, lat] });
+          geometry = sanitizePointGeometry({
+            type: "Point",
+            coordinates: [lon, lat],
+          });
           geometryMethod = "georss-point";
         }
       }
@@ -547,8 +792,37 @@ function normalizeCapAlert(entry, feed) {
       const lat = Number(info.lat || area.lat || root.lat);
       const lon = Number(info.lon || area.lon || root.lon);
       if (Number.isFinite(lat) && Number.isFinite(lon)) {
-        geometry = sanitizePointGeometry({ type: "Point", coordinates: [lon, lat] });
+        geometry = sanitizePointGeometry({
+          type: "Point",
+          coordinates: [lon, lat],
+        });
         geometryMethod = "explicit-latlon";
+      }
+    }
+
+    // 3.0) geocode-based centers (FIPS/UGC) – preferred fallback before counties/states
+    if (!geometry && (fipsCodes.length || ugcCodes.length)) {
+      const geoPts = centersFromFipsAndUgc(fipsCodes, ugcCodes);
+      if (geoPts.length === 1) {
+        geometry = sanitizePointGeometry({
+          type: "Point",
+          coordinates: geoPts[0],
+        });
+        geometryMethod = "cap-geocode-centroid";
+      } else if (geoPts.length > 1) {
+        geometry = pointsCentroid(geoPts);
+        geometryMethod = "cap-geocode-centroid";
+      }
+    }
+
+    // 3.5) county-centroid fallback from areaDesc (before state-center)
+    if (!geometry && areaDesc) {
+      const stateList = extractStateAbbrs(areaDesc);
+      const stateHint = stateList.length === 1 ? stateList[0] : null;
+      const countyGeom = tryCountyCenterFromAreaDesc(areaDesc, stateHint);
+      if (countyGeom) {
+        geometry = countyGeom;
+        geometryMethod = "cap-county-centroid";
       }
     }
 
@@ -557,7 +831,10 @@ function normalizeCapAlert(entry, feed) {
       const stateList = extractStateAbbrs(areaDesc);
       const pts = stateList.map((s) => STATE_CENTERS[s]).filter(Boolean);
       if (pts.length === 1) {
-        geometry = sanitizePointGeometry({ type: "Point", coordinates: pts[0] });
+        geometry = sanitizePointGeometry({
+          type: "Point",
+          coordinates: pts[0],
+        });
         geometryMethod = "state-center";
       } else if (pts.length > 1) {
         geometry = pointsCentroid(pts);
@@ -565,17 +842,31 @@ function normalizeCapAlert(entry, feed) {
       }
     }
 
-    const identifier = String(root.identifier || root.id || `CAP-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const identifier = String(
+      root.identifier ||
+        root.id ||
+        `CAP-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 8)}`
+    );
 
     // Apply jitter ONLY if this is a fallback method (state/county), not polygon/true point
     if (geometry && geometryMethod) {
-      const jittered = maybeApplyJitter(geometry, geometryMethod, identifier);
+      const jittered = maybeApplyJitter(
+        geometry,
+        geometryMethod,
+        identifier
+      );
       geometry = jittered.geometry;
       geometryMethod = jittered.geometryMethod;
     }
 
     if (!geometry) {
-      console.warn(`🚫 Skipping CAP alert with no usable geometry: ${areaDesc || "(no areaDesc)"}`);
+      console.warn(
+        `🚫 Skipping CAP alert with no usable geometry: ${
+          areaDesc || "(no areaDesc)"
+        }`
+      );
       return null;
     }
 
@@ -588,7 +879,9 @@ function normalizeCapAlert(entry, feed) {
     const expiresRaw = info.expires || root.expires || null;
     if (expiresRaw) {
       const parsed = new Date(expiresRaw);
-      expires = isNaN(parsed.getTime()) ? new Date(Date.now() + 60 * 60 * 1000) : parsed;
+      expires = isNaN(parsed.getTime())
+        ? new Date(Date.now() + 60 * 60 * 1000)
+        : parsed;
     } else {
       expires = new Date(Date.now() + 60 * 60 * 1000);
     }
@@ -604,7 +897,9 @@ function normalizeCapAlert(entry, feed) {
     if (source === "USGS") {
       const magMatch = String(root?.title || "").match(/M\s?(\d+\.\d+)/);
       const magnitude = magMatch ? parseFloat(magMatch[1]) : null;
-      const sentTime = parseDateMaybe(info.effective || root.sent || root.updated || Date.now());
+      const sentTime = parseDateMaybe(
+        info.effective || root.sent || root.updated || Date.now()
+      );
 
       if (magnitude !== null && Number.isFinite(magnitude)) {
         if (magnitude < 3.0) {
@@ -623,13 +918,21 @@ function normalizeCapAlert(entry, feed) {
       }
     }
 
-    const headlineText = info.headline || root.title || root.summary || eventName;
+    const headlineText =
+      info.headline || root.title || root.summary || eventName;
 
-    let descriptionText = info.description || root.summary || root.content || "";
-    if (typeof descriptionText === "object" && descriptionText["#text"]) descriptionText = descriptionText["#text"];
+    let descriptionText =
+      info.description || root.summary || root.content || "";
+    if (
+      typeof descriptionText === "object" &&
+      descriptionText["#text"]
+    )
+      descriptionText = descriptionText["#text"];
     descriptionText = String(descriptionText ?? "")
-      .replace(/<dt>/g, "\n").replace(/<\/dt>/g, ": ")
-      .replace(/<dd>/g, "").replace(/<\/dd>/g, "")
+      .replace(/<dt>/g, "\n")
+      .replace(/<\/dt>/g, ": ")
+      .replace(/<dd>/g, "")
+      .replace(/<\/dd>/g, "")
       .replace(/<\/?dl>/g, "")
       .replace(/<br\s*\/?>/gi, "\n")
       .replace(/<\/p>/gi, "\n")
@@ -646,8 +949,10 @@ function normalizeCapAlert(entry, feed) {
       category: info.category || "General",
       event: String(eventName).trim(),
       urgency: info.urgency || (source === "USGS" ? "Past" : "Unknown"),
-      severity: info.severity || (source === "USGS" ? "Minor" : "Unknown"),
-      certainty: info.certainty || (source === "USGS" ? "Observed" : "Unknown"),
+      severity:
+        info.severity || (source === "USGS" ? "Minor" : "Unknown"),
+      certainty:
+        info.certainty || (source === "USGS" ? "Observed" : "Unknown"),
       headline: String(headlineText).trim(),
       description: String(descriptionText).trim(),
       instruction: String(instructionText).trim(),
@@ -656,7 +961,13 @@ function normalizeCapAlert(entry, feed) {
     return {
       identifier,
       sender: String(root.sender || ""),
-      sent: parseDateMaybe(info.effective || root.sent || root.updated || root.published || new Date()),
+      sent: parseDateMaybe(
+        info.effective ||
+          root.sent ||
+          root.updated ||
+          root.published ||
+          new Date()
+      ),
       status: root.status || "Actual",
       msgType: root.msgType || "Alert",
       scope: root.scope || "Public",
@@ -732,16 +1043,24 @@ function normalizeNoaaAlert(feature) {
     if (pts.length) {
       geometry = pointsCentroid(pts);
       bbox = bboxFromPoints(pts);
-      geometryMethod = `noaa-geom-${String(feature.geometry.type || "geom").toLowerCase()}`;
+      geometryMethod = `noaa-geom-${String(
+        feature.geometry.type || "geom"
+      ).toLowerCase()}`;
     }
 
     // --- county centroid fallback (legacy-ish)
     if (!geometry && areaDesc) {
       const states = inferStateAbbrsFromNoaa(props);
       const stateHint = states.length === 1 ? states[0] : null;
-      const countyPts = collectCountyCentersFromAreaDesc(areaDesc, stateHint);
+      const countyPts = collectCountyCentersFromAreaDesc(
+        areaDesc,
+        stateHint
+      );
       if (countyPts.length === 1) {
-        geometry = sanitizePointGeometry({ type: "Point", coordinates: countyPts[0] });
+        geometry = sanitizePointGeometry({
+          type: "Point",
+          coordinates: countyPts[0],
+        });
         geometryMethod = "noaa-county-centroid";
       } else if (countyPts.length > 1) {
         geometry = pointsCentroid(countyPts);
@@ -755,7 +1074,10 @@ function normalizeNoaaAlert(feature) {
       const centers = states.map((s) => STATE_CENTERS[s]).filter(Boolean);
 
       if (centers.length === 1) {
-        geometry = sanitizePointGeometry({ type: "Point", coordinates: centers[0] });
+        geometry = sanitizePointGeometry({
+          type: "Point",
+          coordinates: centers[0],
+        });
         geometryMethod = "noaa-state-center";
       } else if (centers.length > 1) {
         geometry = pointsCentroid(centers);
@@ -767,17 +1089,24 @@ function normalizeNoaaAlert(feature) {
 
     const identifier =
       String(props.id || "") ||
-      (typeof props["@id"] === "string" && props["@id"].includes("/")
+      (typeof props["@id"] === "string" &&
+      props["@id"].includes("/")
         ? props["@id"].split("/").pop()
         : props["@id"]) ||
       (typeof feature.id === "string" && feature.id.includes("/")
         ? feature.id.split("/").pop()
         : feature.id) ||
-      `NOAA-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      `NOAA-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
 
     // Apply jitter only to fallback geometry (state/county), not to polygon-derived geometry
     if (geometry && geometryMethod) {
-      const jittered = maybeApplyJitter(geometry, geometryMethod, identifier);
+      const jittered = maybeApplyJitter(
+        geometry,
+        geometryMethod,
+        identifier
+      );
       geometry = jittered.geometry;
       geometryMethod = jittered.geometryMethod;
     }
@@ -786,17 +1115,29 @@ function normalizeNoaaAlert(feature) {
     geometry = sanitizePointGeometry(geometry);
     if (!geometry) return null;
 
-    const sent = parseDateMaybe(props.sent || props.effective || props.onset || props.updated || new Date());
+    const sent = parseDateMaybe(
+      props.sent ||
+        props.effective ||
+        props.onset ||
+        props.updated ||
+        new Date()
+    );
 
     let expires = null;
     if (props.expires) {
       const parsed = new Date(props.expires);
-      expires = isNaN(parsed.getTime()) ? new Date(Date.now() + 60 * 60 * 1000) : parsed;
+      expires = isNaN(parsed.getTime())
+        ? new Date(Date.now() + 60 * 60 * 1000)
+        : parsed;
     } else {
       expires = new Date(Date.now() + 60 * 60 * 1000);
     }
 
-    const eventName = props.event || (props.headline && String(props.headline).split(" issued")[0]) || "Alert";
+    const eventName =
+      props.event ||
+      (props.headline &&
+        String(props.headline).split(" issued")[0]) ||
+      "Alert";
     const headlineText = props.headline || eventName;
 
     let descriptionText = String(props.description || "")
@@ -902,11 +1243,18 @@ async function saveAlerts(alerts) {
     } catch (err) {
       // This is the critical change: don't let one bad alert block all others.
       skipped++;
-      console.warn("⚠️ Skipped alert during save:", alert?.identifier, "-", err.message);
+      console.warn(
+        "⚠️ Skipped alert during save:",
+        alert?.identifier,
+        "-",
+        err.message
+      );
     }
   }
 
-  console.log(`💾 Saved ${saved} alerts to MongoDB (skipped ${skipped})`);
+  console.log(
+    `💾 Saved ${saved} alerts to MongoDB (skipped ${skipped})`
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -924,7 +1272,11 @@ async function fetchCapFeed(feed) {
       removeNSPrefix: true,
       attributeNamePrefix: "@_",
       trimValues: true,
-      isArray: (tagName) => tagName === "entry" || tagName === "info" || tagName === "area",
+      isArray: (tagName) =>
+        tagName === "entry" ||
+        tagName === "info" ||
+        tagName === "area" ||
+        tagName === "geocode", // 👈 ensure geocode blocks come through as arrays
     });
 
     const json = parser.parse(xml);
@@ -932,10 +1284,14 @@ async function fetchCapFeed(feed) {
     let entries = json.alert ? [json.alert] : json.feed?.entry || [];
     if (!Array.isArray(entries)) entries = [entries];
 
-    const alerts = entries.map((e) => normalizeCapAlert(e, feed)).filter(Boolean);
+    const alerts = entries
+      .map((e) => normalizeCapAlert(e, feed))
+      .filter(Boolean);
     const usable = alerts.filter((a) => a.hasGeometry).length;
 
-    console.log(`✅ Parsed ${alerts.length} alerts from ${feed.source} (${usable} usable geo)`);
+    console.log(
+      `✅ Parsed ${alerts.length} alerts from ${feed.source} (${usable} usable geo)`
+    );
     if (alerts.length) await saveAlerts(alerts);
   } catch (err) {
     console.error(`❌ Error fetching ${feed.name}:`, err.message);
@@ -965,7 +1321,9 @@ async function fetchNoaaAlerts() {
       else skipped++;
     }
 
-    console.log(`✅ NOAA parsed ${alerts.length} alerts (${features.length} raw, ${skipped} skipped)`);
+    console.log(
+      `✅ NOAA parsed ${alerts.length} alerts (${features.length} raw, ${skipped} skipped)`
+    );
 
     if (alerts.length) await saveAlerts(alerts);
   } catch (err) {
