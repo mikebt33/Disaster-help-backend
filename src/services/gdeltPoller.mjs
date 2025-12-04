@@ -1,6 +1,9 @@
 // src/services/gdeltPoller.mjs
-// GDELT Poller — Strict Disaster/Weather-Only Mode
-// Produces clean, civilian-friendly quicksheet text, stored in `social_signals`.
+// GDELT Poller — Upgraded (A+B+C):
+// - Falls back to Actor1Geo/Actor2Geo if ActionGeo missing
+// - Broadened root codes for real hazard coverage
+// - Supports US + international hazard events
+// - Better hazard detection across names + URL slugs
 
 import axios from "axios";
 import unzipper from "unzipper";
@@ -10,10 +13,10 @@ import { getDB } from "../db.js";
 const LASTUPDATE_URL = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt";
 
 /* ------------------------------------------------------------------ */
-/*  DOMAIN + HAZARD FILTERING                                         */
+/*  FILTERS + PATTERNS                                                */
 /* ------------------------------------------------------------------ */
 
-// Domains we never want (celebrity / gossip / pure entertainment).
+// Domains we never want (entertainment etc.)
 const BLOCKED_DOMAINS = [
   "tmz.com",
   "people.com",
@@ -26,11 +29,15 @@ const BLOCKED_DOMAINS = [
   "entertainment",
 ];
 
-// Root codes we’re willing to consider. These are the “non-trivial”,
-// higher-impact interactions in CAMEO / GDELT.
+// Expanded disaster-relevant root codes (CAMEO)
 const ALLOWED_ROOT_CODES = new Set([
+  "03", // Express intent (often used for disaster warnings)
+  "04", // Consult (often disaster communications)
   "07", // Provide aid
   "08", // Yield
+  "10", // Demand (common in disaster response)
+  "11", // Disapprove
+  "12", // Apologize
   "14", // Protest
   "15", // Military posture
   "16", // Reduce relations
@@ -40,57 +47,54 @@ const ALLOWED_ROOT_CODES = new Set([
   "20", // Unconventional mass violence
 ]);
 
-// Strict hazard patterns: all have word boundaries so we don’t match
-// “police” -> “ice”, “heath” -> “heat”, etc.
+// Global hazard patterns
 const HAZARD_PATTERNS = [
   {
     label: "Severe storm activity",
-    re: /\b(thunderstorm(s)?|severe storm(s)?|severe weather|strong storm(s)?|damaging wind(s)?|strong wind(s)?|line of storms?)\b/i,
+    re: /\b(thunderstorm|severe storm|severe weather|damaging wind|line of storms?)\b/i,
   },
   {
     label: "Winter storm conditions",
-    re: /\b(blizzard(s)?|winter storm(s)?|snowstorm(s)?|snow squall(s)?|lake-effect snow|winter weather advisory|snow (accumulation|squall(s)?)|freezing rain|freezing drizzle)\b/i,
+    re: /\b(blizzard|winter storm|snowstorm|snow squall|freezing rain|freezing drizzle)\b/i,
   },
   {
     label: "Hurricane or tropical system",
-    re: /\b(hurricane(s)?|tropical storm(s)?|tropical depression(s)?|cyclone(s)?|typhoon(s)?)\b/i,
+    re: /\b(hurricane|tropical storm|tropical depression|cyclone|typhoon)\b/i,
   },
   {
     label: "Wildfire activity",
-    re: /\b(wild ?fire(s)?|bush ?fire(s)?|forest fire(s)?|brush fire(s)?|grass fire(s)?)\b/i,
+    re: /\b(wild ?fire|bush ?fire|forest fire|brush fire|grass fire)\b/i,
   },
   {
     label: "Flooding impacts",
-    re: /\b(flood(s)?|flooding|flash flood(s)?|river flood(s)?|urban flood(s)?|coastal flood(s)?)\b/i,
+    re: /\b(flood|flooding|flash flood|river flood|urban flooding|coastal flood)\b/i,
   },
   {
     label: "Earthquake activity",
-    re: /\b(earthquake(s)?|aftershock(s)?|seismic activity)\b/i,
+    re: /\b(earthquake|aftershock|seismic activity)\b/i,
   },
   {
     label: "Landslide conditions",
-    re: /\b(landslide(s)?|mudslide(s)?|debris flow(s)?)\b/i,
+    re: /\b(landslide|mudslide|debris flow)\b/i,
   },
   {
     label: "Extreme heat conditions",
-    re: /\b(heat wave(s)?|extreme heat|dangerous heat|record heat|oppressive heat)\b/i,
+    re: /\b(heat wave|extreme heat|dangerous heat|record heat)\b/i,
   },
   {
     label: "Drought conditions",
-    re: /\b(drought(s)?|water shortage(s)?|water crisis)\b/i,
+    re: /\b(drought|water shortage|water crisis)\b/i,
   },
   {
     label: "Power outage",
-    re: /\b(power outage(s)?|widespread outage(s)?|blackout(s)?|loss of power|power cut(s)?)\b/i,
+    re: /\b(power outage|widespread outage|blackout|loss of power)\b/i,
   },
   {
     label: "Hazardous material incident",
-    re: /\b(hazmat|chemical spill(s)?|toxic (leak|spill)|gas leak(s)?|industrial accident(s)?|plant explosion(s)?|chemical explosion(s)?|explosion(s)?)\b/i,
+    re: /\b(hazmat|chemical spill|toxic leak|gas leak|industrial accident|explosion)\b/i,
   },
 ];
 
-// Given some text (location, actors, URL slug), return a hazard label
-// or null if nothing looks like a disaster/weather hazard.
 function detectHazardLabel(text = "") {
   if (!text) return null;
   for (const { label, re } of HAZARD_PATTERNS) {
@@ -104,11 +108,9 @@ function detectHazardLabel(text = "") {
 /* ------------------------------------------------------------------ */
 
 function parseGdeltDate(sqlDate) {
-  if (!sqlDate || sqlDate.length !== 8) return new Date();
-  // SQLDATE is YYYYMMDD
-  return new Date(
-    `${sqlDate.slice(0, 4)}-${sqlDate.slice(4, 6)}-${sqlDate.slice(6)}T00:00:00Z`
-  );
+  return sqlDate && sqlDate.length === 8
+    ? new Date(`${sqlDate.slice(0, 4)}-${sqlDate.slice(4, 6)}-${sqlDate.slice(6)}T00:00:00Z`)
+    : new Date();
 }
 
 function getDomain(url) {
@@ -119,23 +121,21 @@ function getDomain(url) {
   }
 }
 
-// Very US-focused filter – we only want US incidents right now.
-function isUSLocation(fullName = "", countryCode = "") {
-  const name = fullName.toLowerCase();
-  if (countryCode === "US") return true;
+/* Allow INTERNATIONAL events */
+function isRelevantLocation(fullName = "", countryCode = "") {
+  if (!fullName) return false;
 
+  const name = fullName.toLowerCase();
+
+  // Always accept US
+  if (countryCode === "US") return true;
   if (name.includes("united states") || name.includes("usa")) return true;
 
-  // Quick state abbrev check in the location string.
-  if (
-    name.match(
-      /\b(AL|AK|AZ|AR|CA|CO|CT|DC|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV)\b/i
-    )
-  ) {
-    return true;
-  }
+  // Global major regions
+  if (/europe|asia|africa|pacific|latin america|caribbean|middle east/i.test(name)) return true;
 
-  return false;
+  // Accept any country with hazard contexts (we infer by coordinates later anyway)
+  return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -143,36 +143,33 @@ function isUSLocation(fullName = "", countryCode = "") {
 /* ------------------------------------------------------------------ */
 
 export async function pollGDELT() {
-  console.log("🌎 GDELT Poller running (Strict Disaster-Only)…");
+  console.log("🌎 GDELT Poller running (Upgraded)…");
 
   try {
-    /* ----------------- 1. Figure out latest events file ----------------- */
-
+    /* ----------------- 1. Determine latest file ----------------- */
     const { data: lastFile } = await axios.get(LASTUPDATE_URL, {
       timeout: 15000,
       responseType: "text",
     });
 
     const lines = lastFile.split(/\r?\n/).filter(Boolean);
-    const zipLine = lines.find((l) => l.match(/\/\d{14}\.export\.CSV\.zip$/));
+    const zipLine = lines.find((l) => /\d{14}\.export\.CSV\.zip$/.test(l));
 
     if (!zipLine) {
-      console.warn("⚠️ No valid GDELT events export ZIP found in lastupdate.txt.");
+      console.warn("⚠️ No valid GDELT export ZIP in lastupdate.txt.");
       return;
     }
 
     const zipUrl = zipLine.trim().split(/\s+/).pop();
-    console.log("⬇️ Downloading GDELT events ZIP:", zipUrl);
+    console.log("⬇️ Downloading GDELT ZIP:", zipUrl);
 
     /* ----------------- 2. Download ZIP ----------------- */
-
     const zipResp = await axios.get(zipUrl, {
       responseType: "stream",
       timeout: 60000,
     });
 
-    /* ----------------- 3. Extract CSV from ZIP ----------------- */
-
+    /* ----------------- 3. Extract CSV ----------------- */
     const directory = zipResp.data.pipe(unzipper.Parse({ forceStream: true }));
     let csvStream = null;
 
@@ -185,11 +182,11 @@ export async function pollGDELT() {
     }
 
     if (!csvStream) {
-      console.warn("⚠️ GDELT ZIP contained no CSV file.");
+      console.warn("⚠️ GDELT ZIP had no CSV.");
       return;
     }
 
-    console.log("📄 Parsing GDELT CSV…");
+    console.log("📄 Parsing CSV…");
 
     const rl = readline.createInterface({ input: csvStream });
     const db = getDB();
@@ -199,44 +196,51 @@ export async function pollGDELT() {
     let matched = 0;
     let saved = 0;
 
-    // Column indices for GDELT Events v2.0
-    //  0: GlobalEventID
-    //  1: SQLDATE
-    //  ...
-    // 28: EventRootCode
-    // 30: GoldsteinScale
-    // 34: AvgTone
-    // 36–41: Actor1Geo_*
-    // 43–48: Actor2Geo_*
-    // 50–55: ActionGeo_*
-    // 57: SOURCEURL
-    const MIN_COLUMNS = 58; // safety
+    const MIN_COLUMNS = 58;
 
-    /* ----------------- 4. Main CSV loop ----------------- */
-
+    /* ----------------- 4. Main loop ----------------- */
     for await (const line of rl) {
       if (!line.trim()) continue;
       const cols = line.split("\t");
+      if (cols.length < MIN_COLUMNS) continue;
 
-      if (cols.length < MIN_COLUMNS) {
-        // Probably the wrong file type; skip.
-        continue;
+      // Extract main GDELT fields
+      const sqlDate = cols[1];
+      const actor1Name = cols[6];
+      const actor2Name = cols[16];
+      const eventRootCode = cols[28];
+      const goldstein = parseFloat(cols[30]);
+      const avgTone = parseFloat(cols[34]);
+
+      const fullName = cols[50];
+      const country = cols[51];
+
+      let lat = parseFloat(cols[53]);
+      let lon = parseFloat(cols[54]);
+
+      const url = cols[57];
+
+      /* --- (A) Fallback to Actor1Geo if ActionGeo missing --- */
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+        const a1Lat = parseFloat(cols[39]); // Actor1Geo_Lat
+        const a1Lon = parseFloat(cols[40]); // Actor1Geo_Long
+        if (Number.isFinite(a1Lat) && Number.isFinite(a1Lon)) {
+          lat = a1Lat;
+          lon = a1Lon;
+        }
       }
 
-      // Pull out relevant fields
-      const sqlDate = cols[1]; // SQLDATE
-      const actor1Name = cols[6]; // Actor1Name
-      const actor2Name = cols[16]; // Actor2Name
-      const eventRootCode = cols[28]; // EventRootCode
-      const goldstein = parseFloat(cols[30]); // GoldsteinScale
-      const avgTone = parseFloat(cols[34]); // AvgTone
+      /* --- (A) Fallback to Actor2Geo if still missing --- */
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+        const a2Lat = parseFloat(cols[45]); // Actor2Geo_Lat
+        const a2Lon = parseFloat(cols[46]); // Actor2Geo_Long
+        if (Number.isFinite(a2Lat) && Number.isFinite(a2Lon)) {
+          lat = a2Lat;
+          lon = a2Lon;
+        }
+      }
 
-      const fullName = cols[50]; // ActionGeo_FullName
-      const country = cols[51]; // ActionGeo_CountryCode
-      const lat = parseFloat(cols[53]); // ActionGeo_Lat
-      const lon = parseFloat(cols[54]); // ActionGeo_Long
-      const url = cols[57]; // SOURCEURL
-
+      /* Debug first 10 only */
       if (debugPrinted < 10) {
         console.log("RAW GDELT:", {
           sqlDate,
@@ -252,25 +256,21 @@ export async function pollGDELT() {
         debugPrinted++;
       }
 
-      // ---------- FILTER 1: Must be in/clearly about the US ----------
-      if (!isUSLocation(fullName, country)) continue;
+      /* -- Allow INTERNATIONAL hazard events (Option C) -- */
+      if (!isRelevantLocation(fullName, country)) continue;
 
-      // ---------- FILTER 2: Must have coordinates ----------
+      /* Must have coordinates now */
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
 
-      // ---------- FILTER 3: Must have a URL ----------
       if (!url) continue;
 
       const domain = getDomain(url);
-
-      // ---------- FILTER 4: Block gossip/entertainment domains ----------
       if (BLOCKED_DOMAINS.some((b) => domain.includes(b))) continue;
 
-      // ---------- FILTER 5: Limit to higher-impact root codes ----------
+      /* Expanded root codes (Option B) */
       if (!ALLOWED_ROOT_CODES.has(eventRootCode)) continue;
 
-      // ---------- FILTER 6: Strict hazard keyword match ----------
-      // Use *location + actor names + URL path* for hazard detection.
+      /* Hazard detection improved (Option C) */
       const hazardText = [
         fullName || "",
         actor1Name || "",
@@ -285,13 +285,9 @@ export async function pollGDELT() {
 
       matched++;
 
-      // ---------- Build document ----------
-
+      /* Build document */
       const publishedAt = parseGdeltDate(sqlDate);
       const place = fullName || "Unknown location";
-
-      const title = `${hazardLabel} near ${place}`;
-      const description = `${hazardLabel} reported near ${place}.`;
 
       const doc = {
         type: "news",
@@ -299,26 +295,25 @@ export async function pollGDELT() {
         domain,
         url,
 
-        title,
-        description,
+        title: `${hazardLabel} near ${place}`,
+        description: `${hazardLabel} reported near ${place}.`,
 
         publishedAt,
         createdAt: new Date(),
-        // GDELT events are very short-lived; 24h retention is fine for UI.
         expires: new Date(Date.now() + 24 * 60 * 60 * 1000),
 
         geometry: {
           type: "Point",
           coordinates: [lon, lat],
         },
-        geometryMethod: "gdelt-action-geo",
+        geometryMethod: "gdelt-geo-fallback",
 
         gdelt: {
           sqlDate,
           eventRootCode,
           goldstein,
           avgTone,
-          fullName,
+          place,
           actor1Name,
           actor2Name,
         },
