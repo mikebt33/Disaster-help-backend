@@ -44,20 +44,8 @@ try {
   fipsCenters = {};
 }
 
-const ugcCentersPath = path.resolve(__dirname, "../data/ugc_centers.json");
-let ugcCenters = {};
-try {
-  if (fs.existsSync(ugcCentersPath)) {
-    ugcCenters = JSON.parse(fs.readFileSync(ugcCentersPath, "utf8"));
-  } else {
-    console.warn(
-      "ℹ️ ugc_centers.json not found; CAP UGC geocodes will fall back to counties/state."
-    );
-  }
-} catch (err) {
-  console.warn("⚠️ Failed to load ugc_centers.json:", err.message);
-  ugcCenters = {};
-}
+// UGC centroids intentionally not supported; modern CAP uses polygons/counties/FIPS
+const ugcCenters = {};
 
 /* ------------------------------------------------------------------ */
 /*  CONFIG                                                            */
@@ -648,26 +636,12 @@ function tryCountyCenterFromAreaDesc(areaDesc, stateHint) {
  * Uses fips_centers.json and ugc_centers.json if present.
  */
 function centersFromFipsAndUgc(fipsCodes = [], ugcCodes = []) {
+  // UGC intentionally ignored (Option A).
   const pts = [];
 
   for (const code of fipsCodes) {
     const p = fipsCenters?.[code];
-    if (
-      Array.isArray(p) &&
-      p.length >= 2 &&
-      isFiniteLonLat(p[0], p[1])
-    ) {
-      pts.push(p);
-    }
-  }
-
-  for (const code of ugcCodes) {
-    const p = ugcCenters?.[code];
-    if (
-      Array.isArray(p) &&
-      p.length >= 2 &&
-      isFiniteLonLat(p[0], p[1])
-    ) {
+    if (Array.isArray(p) && p.length >= 2 && isFiniteLonLat(p[0], p[1])) {
       pts.push(p);
     }
   }
@@ -736,7 +710,6 @@ function normalizeCapAlert(entry, feed) {
 
       const codes = String(value).trim().split(/\s+/);
       if (/FIPS/i.test(valueName)) fipsCodes.push(...codes);
-      if (/UGC/i.test(valueName)) ugcCodes.push(...codes);
     }
 
     let polygonRaw =
@@ -800,9 +773,9 @@ function normalizeCapAlert(entry, feed) {
       }
     }
 
-    // 3.0) geocode-based centers (FIPS/UGC) – preferred fallback before counties/states
-    if (!geometry && (fipsCodes.length || ugcCodes.length)) {
-      const geoPts = centersFromFipsAndUgc(fipsCodes, ugcCodes);
+   // 3.0) geocode-based centers (FIPS only)
+   if (!geometry && fipsCodes.length) {
+     const geoPts = centersFromFips(fipsCodes);
       if (geoPts.length === 1) {
         geometry = sanitizePointGeometry({
           type: "Point",
