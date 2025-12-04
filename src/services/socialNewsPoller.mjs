@@ -222,18 +222,16 @@ export async function pollNewsAPI() {
   console.log("📰 NewsAPI poll running…");
 
   try {
-    const hazardQuery = HAZARD_WORDS.join(" OR ");
+    const hazardQuery = "(" + HAZARD_WORDS.join(" OR ") + ") AND (USA OR United States OR U.S. OR US)";
 
     const now = new Date();
     const from = new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
     const to = now.toISOString();
 
-   const sources = "the-weather-channel,associated-press,abc-news,nbc-news,fox-news,npr,bloomberg,usa-today";
-
+   // Remove sources filter — too restrictive on free API tier
    const url =
      `${NEWS_API_URL}?q=${encodeURIComponent(hazardQuery)}` +
-     `&sources=${sources}` +
-     `&language=en&from=${from}&to=${to}&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
+     `&language=en&from=${from}&sortBy=relevancy&pageSize=50&apiKey=${NEWS_API_KEY}`;
 
     console.log("🔍 URL:", url);
 
