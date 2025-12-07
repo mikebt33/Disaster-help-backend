@@ -76,32 +76,38 @@ const CAP_FEEDS = [
 
 /**
  * Anti-stacking jitter (deterministic per alert identifier).
- * Defaults are "wide" for state-centers to visibly spread stacked points.
+ *
+ * UPDATED DEFAULTS (tightened):
+ *  - ALERT_JITTER_STATE_MIN_MILES=1
+ *  - ALERT_JITTER_STATE_MAX_MILES=5
+ *  - ALERT_JITTER_COUNTY_MIN_MILES=0.5
+ *  - ALERT_JITTER_COUNTY_MAX_MILES=2
  *
  * Env knobs:
  *  - ALERT_GEO_JITTER=false          disable all jitter
- *  - ALERT_JITTER_STATE_MIN_MILES=20
- *  - ALERT_JITTER_STATE_MAX_MILES=50
- *  - ALERT_JITTER_COUNTY_MIN_MILES=4
- *  - ALERT_JITTER_COUNTY_MAX_MILES=12
+ *  - ALERT_JITTER_STATE_MIN_MILES
+ *  - ALERT_JITTER_STATE_MAX_MILES
+ *  - ALERT_JITTER_COUNTY_MIN_MILES
+ *  - ALERT_JITTER_COUNTY_MAX_MILES
  */
 const GEO_JITTER_ENABLED =
   String(process.env.ALERT_GEO_JITTER ?? "true").toLowerCase() !== "false";
+
 const JITTER_STATE_MIN_MILES = safeNumber(
   process.env.ALERT_JITTER_STATE_MIN_MILES,
-  20
+  1
 );
 const JITTER_STATE_MAX_MILES = safeNumber(
   process.env.ALERT_JITTER_STATE_MAX_MILES,
-  50
+  5
 );
 const JITTER_COUNTY_MIN_MILES = safeNumber(
   process.env.ALERT_JITTER_COUNTY_MIN_MILES,
-  4
+  0.5
 );
 const JITTER_COUNTY_MAX_MILES = safeNumber(
   process.env.ALERT_JITTER_COUNTY_MAX_MILES,
-  12
+  2
 );
 
 /** Fallback centers for state-level alerts (lon, lat) */
@@ -867,7 +873,6 @@ function normalizeCapAlert(entry, feed) {
 
     // 3.0) geocode-based centers (FIPS only)
     if (!geometry && fipsCodes.length) {
-      // 🔧 FIX: centersFromFips(...) did not exist; use your real function
       const geoPts = centersFromFipsAndUgc(fipsCodes, ugcCodes);
       if (geoPts.length === 1) {
         geometry = sanitizePointGeometry({
