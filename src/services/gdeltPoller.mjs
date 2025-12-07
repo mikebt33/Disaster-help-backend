@@ -1,24 +1,29 @@
 // src/services/gdeltPoller.mjs
-// FINAL WORKING GDELT POLLER — WORLDWIDE, EVENT-CODE BOOSTED
-// -----------------------------------------------------------
-// - Worldwide ingest (no US-only filter)
+// GDELT Poller — Worldwide, hazard-max, TLS-safe, event-code boosted.
+//
+// - Worldwide ingest (no US-only restriction)
 // - TLS-safe URL rewriting -> storage.googleapis.com
 // - Event-root-code + event-code hazard boosting
 // - Expanded hazard keyword detection (URL slugs, outages, windstorm, etc.)
-// - Loosened domain blocking
+// - Damage/impact fallback classification
+// - Loosened domain blocking (only hard celeb domains)
 // - BulkWrite batching + TTL expiration
-// - Guaranteed hazard output every run
+// - Slight coordinate micro-jitter to reduce stacking
 
 import axios from "axios";
 import unzipper from "unzipper";
 import readline from "readline";
 import { getDB } from "../db.js";
 
-// GDELT "lastupdate" list
-const LASTUPDATE_URL = "https://storage.googleapis.com/data.gdeltproject.org/gdeltv2/lastupdate.txt";
+// ---------------------------------------------------------------------------
+// CONFIG / CONSTANTS
+// ---------------------------------------------------------------------------
+
+// lastupdate list (we still use the original endpoint; its CSV rows point to data.gdelt URLs)
+const LASTUPDATE_URL = "https://data.gdeltproject.org/gdeltv2/lastupdate.txt";
 const USER_AGENT = process.env.GDELT_USER_AGENT || "disaster-help-backend/1.0";
 
-// Rewrite function to bypass TLS mismatch issues
+// Rewrite function to bypass TLS mismatch issues for ZIP downloads
 function rewriteGdeltUrl(url) {
   return url.replace(
     /^https?:\/\/data\.gdeltproject\.org\//i,
@@ -84,29 +89,34 @@ const BLOCKED_DOMAIN_SUBSTRINGS = [
 const TTL_HOURS = Number(process.env.GDELT_TTL_HOURS) || 24;
 const TTL_MS = TTL_HOURS * 60 * 60 * 1000;
 
-// EVENT-ROOT hazard boosting (A2)
+// Max saved per run (safety)
+const MAX_SAVE = Number(process.env.GDELT_MAX_SAVE) || 400;
+const BATCH_SIZE = Number(process.env.GDELT_BATCH_SIZE) || 250;
+
+// ---------------------------------------------------------------------------
+// HAZARD BOOSTING: roots + codes + damage fallback
+// ---------------------------------------------------------------------------
+
+// EVENT-ROOT hazard boosting
 const HAZARD_ROOTCODES = new Set([
-  "07", // Provide aid (often disasters)
-  "08", // Yield (often evacuations)
-  "10", // Demand (may include urgent needs)
-  "11", // Disapprove
-  "14", // Protest/impact
-  "15", // Military mobilization (storms often logged here)
-  "18", // Assault (storm/damage sometimes miscoded)
-  "19", // Fight
-  "20", // Unconventional violence (major disasters)
+  "07", // provide aid
+  "08", // yield
+  "10", "11", // demand / disapprove
+  "14", // protest / social impact
+  "15", // mobilization, can be disaster response
+  "18", "19", "20", // various high-impact interactions (often mis-coded disasters)
 ]);
 
-// EVENT-CODE hazard boosting (specific high-signal codes)
+// EVENT-CODE hazard boosting (high-signal codes)
 const HAZARD_EVENTCODES = new Set([
-  "102", "103", // Emergency declarations
-  "190", "191", // Humanitarian relief
-  "193",        // Evacuations
-  "194",        // Emergency services mobilized
-  "195",        // Rescue operations
+  "102", "103", // emergency declarations
+  "190", "191", // humanitarian relief
+  "193", // evacuations
+  "194", // emergency services mobilized
+  "195", // rescue operations
 ]);
 
-// Enhanced hazard patterns (B1)
+// Text-based hazard patterns (medium-loose)
 const HAZARD_PATTERNS = [
   { label: "Tornado", re: /\b(tornado|twister|waterspout)\b/i },
   { label: "Hurricane / Tropical", re: /\b(hurricane|tropical storm|cyclone|typhoon)\b/i },
@@ -132,7 +142,14 @@ const HAZARD_PATTERNS = [
   { label: "Explosion / Hazmat", re: /\b(explosion|hazmat|chemical spill|toxic leak)\b/i },
 ];
 
-function detectHazard(text) {
+// Damage / impact fallback
+const DAMAGE_PATTERN =
+  /\b(collaps(ed|e)|destroyed|damaged|washed away|washed out|swept away|missing|injured|killed|dead|fatalities|displaced|evacuate(d|ion)|rescu(e|ed|ing)|stranded|trapped)\b/i;
+
+// Generic “impact event” label when damage words appear but explicit hazard not found
+const GENERIC_IMPACT_LABEL = "Significant Impact Event";
+
+function detectHazardFromText(text) {
   if (!text) return null;
   for (const { label, re } of HAZARD_PATTERNS) {
     if (re.test(text)) return label;
@@ -140,22 +157,49 @@ function detectHazard(text) {
   return null;
 }
 
-function getDomain(url) {
-  try {
-    return new URL(url).hostname.replace(/^www\./, "");
-  } catch {
-    return "";
-  }
+function classifyHazard({
+  actor1,
+  actor2,
+  place,
+  url,
+  domain,
+  eventCode,
+  rootCode,
+}) {
+  const raw = [actor1, actor2, place, url, domain]
+    .join(" ")
+    .replace(/[-_/]+/g, " ")
+    .toLowerCase();
+
+  // 1) Text hazard detection
+  const textHazard = detectHazardFromText(raw);
+  if (textHazard) return textHazard;
+
+  // 2) Damage / impact fallback
+  if (DAMAGE_PATTERN.test(raw)) return GENERIC_IMPACT_LABEL;
+
+  // 3) Event-root hazard boosting
+  if (HAZARD_ROOTCODES.has(rootCode)) return "Significant Event";
+
+  // 4) Event-code hazard boosting
+  if (HAZARD_EVENTCODES.has(eventCode)) return "Emergency Response";
+
+  return null;
 }
 
-function isBlocked(domain) {
-  return BLOCKED_DOMAIN_SUBSTRINGS.some((b) => domain.includes(b));
-}
+// ---------------------------------------------------------------------------
+// GEO HELPERS
+// ---------------------------------------------------------------------------
 
-// Coordinate helpers
 function validLonLat(lon, lat) {
-  return Number.isFinite(lat) && Number.isFinite(lon) &&
-         lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+  return (
+    Number.isFinite(lat) &&
+    Number.isFinite(lon) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lon >= -180 &&
+    lon <= 180
+  );
 }
 
 // Pick best geo (Action > Actor1 > Actor2)
@@ -169,7 +213,7 @@ function pickGeo(cols) {
       country: cols[IDX.ACTIONGEO_COUNTRY],
       adm1: cols[IDX.ACTIONGEO_ADM1],
       adm2: cols[IDX.ACTIONGEO_ADM2],
-      scoreBonus: 0.3,
+      bonus: 0.3,
     },
     {
       method: "actor1",
@@ -179,7 +223,7 @@ function pickGeo(cols) {
       country: cols[IDX.ACTOR1GEO_COUNTRY],
       adm1: cols[IDX.ACTOR1GEO_ADM1],
       adm2: cols[IDX.ACTOR1GEO_ADM2],
-      scoreBonus: 0.1,
+      bonus: 0.15,
     },
     {
       method: "actor2",
@@ -189,60 +233,74 @@ function pickGeo(cols) {
       country: cols[IDX.ACTOR2GEO_COUNTRY],
       adm1: cols[IDX.ACTOR2GEO_ADM1],
       adm2: cols[IDX.ACTOR2GEO_ADM2],
-      scoreBonus: 0,
+      bonus: 0.05,
     },
   ];
 
   let best = null;
-
   for (const c of candidates) {
     if (!validLonLat(c.lon, c.lat)) continue;
 
-    let score = 0;
-    if (c.adm1) score += 2;
-    if (c.adm2) score += 2;
+    let score = c.bonus;
+    if (c.adm1) score += 1.5;
+    if (c.adm2) score += 1.0;
 
     const name = String(c.fullName || "").trim();
     if (name) {
-      const parts = name.split(",").map(s => s.trim());
+      const parts = name.split(",").map((p) => p.trim());
       score += Math.min(4, parts.length);
     }
 
-    score += c.scoreBonus;
-
-    if (!best || score > best.score) {
-      best = { ...c, score };
-    }
+    if (!best || score > best.score) best = { ...c, score };
   }
 
   return best;
 }
 
-// Hazard test that merges text + event codes
-function classifyHazard({ actor1, actor2, place, url, domain, eventCode, rootCode }) {
-  const text = [actor1, actor2, place, url, domain]
-    .join(" ")
-    .replace(/[-_/]+/g, " ")
-    .toLowerCase();
+// Slight micro-jitter to reduce map stacking (seeded by globalEventId + url)
+function microJitter(lon, lat, seedStr, maxDeg = 0.15) {
+  const s = String(seedStr || "");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  const rand = () => {
+    h += 0x6d2b79f5;
+    let t = Math.imul(h ^ (h >>> 15), 1 | h);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 
-  // Text match
-  const txt = detectHazard(text);
-  if (txt) return txt;
+  const jitterLon = lon + (rand() - 0.5) * maxDeg;
+  const jitterLat = lat + (rand() - 0.5) * maxDeg;
 
-  // Event root code boosting
-  if (HAZARD_ROOTCODES.has(rootCode)) return "Significant Event";
-
-  // Event code boosting
-  if (HAZARD_EVENTCODES.has(eventCode)) return "Emergency Response";
-
-  return null;
+  if (!validLonLat(jitterLon, jitterLat)) return [lon, lat];
+  return [jitterLon, jitterLat];
 }
 
-export async function pollGDELT() {
-  console.log("🌎 GDELT Poller (FINAL WORLDWIDE) running…");
+// ---------------------------------------------------------------------------
+// DOMAIN / UTILS
+// ---------------------------------------------------------------------------
 
-  const MAX_SAVE = Number(process.env.GDELT_MAX_SAVE) || 400;
-  const BATCH_SIZE = Number(process.env.GDELT_BATCH_SIZE) || 250;
+function getDomain(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+function isBlocked(domain) {
+  return BLOCKED_DOMAIN_SUBSTRINGS.some((b) => domain.includes(b));
+}
+
+// ---------------------------------------------------------------------------
+// MAIN POLLER
+// ---------------------------------------------------------------------------
+
+export async function pollGDELT() {
+  console.log("🌎 GDELT Poller (HAZARD-MAX WORLDWIDE) running…");
 
   let scanned = 0;
   let withUrl = 0;
@@ -260,33 +318,34 @@ export async function pollGDELT() {
       headers: { "User-Agent": USER_AGENT },
     });
 
-    const line = String(lastTxt)
-      .split(/\r?\n/)
-      .find(l => l.includes(".export.CSV.zip"));
+    const lines = String(lastTxt).split(/\r?\n/).filter(Boolean);
 
-    if (!line) {
-      console.warn("⚠️ No GDELT ZIP found");
+    // For hazard-max, we can process the most recent CSV only.
+    // (If you want multi-CSV lookback, you can extend this to lines[0..1])
+    const entryLine = lines.find((l) => l.includes(".export.CSV.zip"));
+    if (!entryLine) {
+      console.warn("⚠️ No GDELT export ZIP found in lastupdate.txt");
       return;
     }
 
-    const originalUrl = line.trim().split(/\s+/).pop();
+    const originalUrl = entryLine.trim().split(/\s+/).pop();
     const zipUrl = rewriteGdeltUrl(originalUrl);
 
     console.log("⬇️ GDELT ZIP URL:", zipUrl);
 
-    // 2) download ZIP
-    const zipStream = await axios.get(zipUrl, {
+    // 2) Download ZIP
+    const zipResp = await axios.get(zipUrl, {
       responseType: "stream",
       timeout: 60000,
       headers: { "User-Agent": USER_AGENT },
     });
 
-    // 3) extract CSV
-    const directory = zipStream.data.pipe(unzipper.Parse({ forceStream: true }));
+    // 3) Extract CSV
+    const directory = zipResp.data.pipe(unzipper.Parse({ forceStream: true }));
     let csvStream = null;
 
     for await (const entry of directory) {
-      if (entry.path.endsWith(".CSV") || entry.path.endsWith(".csv")) {
+      if (entry.path.toLowerCase().endsWith(".csv")) {
         csvStream = entry;
         break;
       }
@@ -294,7 +353,7 @@ export async function pollGDELT() {
     }
 
     if (!csvStream) {
-      console.warn("⚠️ ZIP had no CSV");
+      console.warn("⚠️ GDELT ZIP had no CSV");
       return;
     }
 
@@ -304,8 +363,12 @@ export async function pollGDELT() {
     const db = getDB();
     const col = db.collection("social_signals");
 
-    // cleanup expired
-    await col.deleteMany({ source: "GDELT", expires: { $lte: now } });
+    // TTL cleanup for old GDELT docs
+    try {
+      await col.deleteMany({ source: "GDELT", expires: { $lte: now } });
+    } catch (e) {
+      console.warn("⚠️ TTL cleanup warning (GDELT):", e.message);
+    }
 
     let bulk = [];
 
@@ -363,6 +426,16 @@ export async function pollGDELT() {
 
       const expires = new Date(publishedAt.getTime() + TTL_MS);
 
+      // Micro-jitter to avoid stacking identical coords (seeded by GID + URL)
+      const baseLon = geo.lon;
+      const baseLat = geo.lat;
+      const [jLon, jLat] = microJitter(
+        baseLon,
+        baseLat,
+        `${cols[IDX.GLOBALEVENTID]}|${url}`,
+        0.12
+      );
+
       const doc = {
         type: "news",
         source: "GDELT",
@@ -377,9 +450,9 @@ export async function pollGDELT() {
         updatedAt: now,
         expires,
 
-        geometry: { type: "Point", coordinates: [geo.lon, geo.lat] },
-        lat: geo.lat,
-        lon: geo.lon,
+        geometry: { type: "Point", coordinates: [jLon, jLat] },
+        lat: jLat,
+        lon: jLon,
         geometryMethod: `gdelt-${geo.method}`,
 
         gdelt: {
@@ -412,7 +485,12 @@ export async function pollGDELT() {
         bulk = [];
       }
 
-      if (saved >= MAX_SAVE) break;
+      if (saved >= MAX_SAVE) {
+        console.log(
+          `🧯 GDELT reached MAX_SAVE=${MAX_SAVE}, stopping ingestion early.`
+        );
+        break;
+      }
     }
 
     if (bulk.length) await col.bulkWrite(bulk, { ordered: false });
