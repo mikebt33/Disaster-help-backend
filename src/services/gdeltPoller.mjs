@@ -15,7 +15,7 @@ import readline from "readline";
 import { getDB } from "../db.js";
 
 // GDELT "lastupdate" list
-const LASTUPDATE_URL = "https://data.gdeltproject.org/gdeltv2/lastupdate.txt";
+const LASTUPDATE_URL = "https://storage.googleapis.com/data.gdeltproject.org/gdeltv2/lastupdate.txt";
 const USER_AGENT = process.env.GDELT_USER_AGENT || "disaster-help-backend/1.0";
 
 // Rewrite function to bypass TLS mismatch issues
