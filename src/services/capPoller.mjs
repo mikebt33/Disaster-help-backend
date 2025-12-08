@@ -1,20 +1,36 @@
 // src/services/capPoller.mjs
 //
-// Unified Official Alert Poller
-// - NWS / NOAA Weather API (/alerts)
-// - FEMA IPAWS CAP
-// - USGS Earthquake Atom feed
+// Global + US Official Alert Poller (drop-in, no new dependencies)
+// - NOAA NWS Alerts (api.weather.gov /alerts + zone geometry centroid support)
+// - FEMA IPAWS CAP (XML)  [may fail in some environments if DNS blocks ipaws.nws.noaa.gov]
+// - USGS Earthquake Atom feed (XML)
+// - GDACS (global disasters: EQ/TC/FL/VO via GeoJSON API)
+// - Meteoalarm (EU weather warnings via RSS/Atom)
 //
 // Normalizes alerts into a common schema and saves to MongoDB: alerts_cap
 // Adds deterministic jitter ONLY for fallback-based points (county/state),
 // never for polygon-derived or zone-derived points.
 //
-// Upgrades in this version:
-// - Marine filtering applies to NOAA + CAP
-// - ✅ Zone geometry support for NOAA alerts (affectedZones + UGC -> /zones/... geometry)
-// - ✅ Prefetch + cache zone centroids (concurrency-limited)
-// - ✅ Tightened jitter defaults; jitter only on county/state fallbacks
-// - ✅ Optional “skip Minor” severity (default true via ALERT_SKIP_MINOR)
+// Notes:
+// - “Global CAP” is not a single standard feed; GDACS + Meteoalarm are pragmatic MVP adds.
+// - Both global feeds are fully optional via env toggles.
+//
+// Env toggles (optional):
+// - GDACS_ENABLED=true|false
+// - GDACS_EVENTTYPES="EQ,TC,FL,VO"   (default)
+// - GDACS_LOOKBACK_HOURS=168
+// - GDACS_MAX_SAVE=200
+//
+// - METEOALARM_ENABLED=true|false
+// - METEOALARM_FEED_URL="https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-rss-europe"
+// - METEOALARM_MAX_SAVE=250
+//
+// Existing envs still apply:
+// - NOAA_ALERTS_URL, NOAA_USER_AGENT, NOAA_ZONE_CONCURRENCY
+// - FEMA_IPAWS_URL, USGS_QUAKES_URL
+// - ALERT_SKIP_MINOR, ALERT_GEO_JITTER, ALERT_JITTER_*
+//
+// ---------------------------------------------------------------
 
 import axios from "axios";
 import { XMLParser } from "fast-xml-parser";
@@ -132,6 +148,36 @@ const JITTER_COUNTY_MAX_MILES = safeNumber(
 const NOAA_ZONE_CONCURRENCY = Math.max(
   1,
   safeNumber(process.env.NOAA_ZONE_CONCURRENCY, 8)
+);
+
+/* -------------------- Global feeds (no new deps) -------------------- */
+
+const GDACS_ENABLED =
+  String(process.env.GDACS_ENABLED ?? "true").toLowerCase() !== "false";
+const GDACS_EVENTS_URL =
+  process.env.GDACS_EVENTS_URL ||
+  "https://www.gdacs.org/gdacsapi/api/events/geteventlist/MAP";
+const GDACS_EVENTTYPES = String(process.env.GDACS_EVENTTYPES || "EQ,TC,FL,VO")
+  .split(/[,\s]+/)
+  .map((s) => s.trim().toUpperCase())
+  .filter(Boolean);
+const GDACS_LOOKBACK_HOURS = Math.max(
+  1,
+  safeNumber(process.env.GDACS_LOOKBACK_HOURS, 168) // 7 days
+);
+const GDACS_MAX_SAVE = Math.max(
+  0,
+  Math.floor(safeNumber(process.env.GDACS_MAX_SAVE, 200))
+);
+
+const METEOALARM_ENABLED =
+  String(process.env.METEOALARM_ENABLED ?? "true").toLowerCase() !== "false";
+const METEOALARM_FEED_URL =
+  process.env.METEOALARM_FEED_URL ||
+  "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-rss-europe";
+const METEOALARM_MAX_SAVE = Math.max(
+  0,
+  Math.floor(safeNumber(process.env.METEOALARM_MAX_SAVE, 250))
 );
 
 /** Fallback centers for state-level alerts (lon, lat) */
@@ -515,7 +561,7 @@ function extractStateAbbrs(text) {
 
   const codes =
     String(text).match(
-      /\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|PR|GU|AS|MP|VI)\b/g
+      /\b(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WV|WY|PR|GU|AS|MP|VI)\b/g
     ) || [];
   codes.forEach((c) => set.add(c));
 
@@ -1012,6 +1058,539 @@ async function centroidFromNoaaZones(props = {}) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  GLOBAL FEEDS (GDACS, METEOALARM)                                  */
+/* ------------------------------------------------------------------ */
+
+// GDACS mappings
+const GDACS_TYPE_TO_EVENT = {
+  EQ: "Earthquake",
+  TC: "Tropical Cyclone",
+  FL: "Flood",
+  VO: "Volcano",
+};
+
+function gdacsCategoryForType(t) {
+  const tt = String(t || "").toUpperCase();
+  if (tt === "EQ" || tt === "VO") return "Geo";
+  if (tt === "TC" || tt === "FL") return "Met";
+  return "General";
+}
+
+function gdacsSeverityFromLevel(level) {
+  const s = String(level || "").trim().toLowerCase();
+  if (s === "red") return "Extreme";
+  if (s === "orange") return "Severe";
+  if (s === "yellow") return "Moderate";
+  if (s === "green") return "Minor";
+  return "Unknown";
+}
+
+function centroidFromGeoJSONGeometry(geom) {
+  if (!geom) return { geometry: null, bbox: null, method: null };
+
+  // Prefer Point directly.
+  if (geom.type === "Point" && Array.isArray(geom.coordinates)) {
+    const g = sanitizePointGeometry({ type: "Point", coordinates: geom.coordinates });
+    return { geometry: g, bbox: g ? [g.coordinates[0], g.coordinates[1], g.coordinates[0], g.coordinates[1]] : null, method: "geojson-point" };
+  }
+
+  // Otherwise centroid from all points.
+  const pts = flattenNoaaGeometryPoints(geom);
+  if (!pts.length) return { geometry: null, bbox: null, method: null };
+
+  const geometry = pointsCentroid(pts);
+  const bbox = bboxFromPoints(pts);
+  return { geometry, bbox, method: `geojson-${String(geom.type || "geom").toLowerCase()}` };
+}
+
+function normalizeGdacsFeature(feature) {
+  try {
+    const props = feature?.properties || {};
+    const eventId =
+      props.eventid ??
+      props.eventId ??
+      props.id ??
+      feature?.id ??
+      null;
+
+    if (!eventId) return null;
+
+    const eventTypeRaw =
+      props.eventtype ?? props.eventType ?? props.event_type ?? "";
+    const eventType = String(eventTypeRaw).trim().toUpperCase();
+
+    const eventName = GDACS_TYPE_TO_EVENT[eventType] || "Disaster Event";
+
+    const level =
+      props.alertlevel ??
+      props.alertLevel ??
+      props.alert_level ??
+      props.level ??
+      "";
+
+    const severity = gdacsSeverityFromLevel(level);
+    if (SKIP_MINOR_ALERTS && isMinorSeverity(severity)) return null;
+
+    const { geometry, bbox, method } = centroidFromGeoJSONGeometry(feature?.geometry);
+    if (!geometry) return null;
+
+    const sent = parseDateMaybe(
+      props.fromdate || props.fromDate || props.date || props.published || props.updated
+    );
+
+    // If GDACS provides an end date, use it; else TTL fallback.
+    const expires = (() => {
+      const end = props.todate || props.toDate || props.enddate || props.endDate || null;
+      if (end) {
+        const d = new Date(end);
+        if (!isNaN(d.getTime())) return d;
+      }
+      return new Date(sent.getTime() + 24 * 60 * 60 * 1000);
+    })();
+
+    const name =
+      props.name ||
+      props.title ||
+      props.eventname ||
+      props.eventName ||
+      `${eventName} (GDACS)`;
+
+    const areaDesc =
+      props.country ||
+      props.countries ||
+      props.region ||
+      props.location ||
+      props.where ||
+      "";
+
+    const url = props.url || props.link || props.details || "";
+
+    const headlineText = name;
+    const descriptionText = String(props.description || props.summary || "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n")
+      .replace(/<[^>]*>/g, "")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n\s*\n/g, "\n")
+      .trim();
+
+    const infoBlock = {
+      category: gdacsCategoryForType(eventType),
+      event: String(eventName).trim(),
+      urgency: "Unknown",
+      severity,
+      certainty: "Unknown",
+      headline: String(headlineText).trim(),
+      description: descriptionText.trim() || String(url || "").trim(),
+      instruction: "",
+    };
+
+    return {
+      identifier: `GDACS-${eventId}`,
+      sender: "GDACS",
+      sent,
+      status: "Actual",
+      msgType: "Alert",
+      scope: "Public",
+      info: infoBlock,
+      area: { areaDesc: String(areaDesc || "").trim(), polygon: null },
+      geometry,
+      geometryMethod: `gdacs-${method || "geojson"}`,
+      bbox,
+      hasGeometry: true,
+      title: String(headlineText).trim(),
+      summary: descriptionText.trim(),
+      source: "GDACS",
+      timestamp: new Date(),
+      expires,
+      gdacs: {
+        eventId: String(eventId),
+        eventType,
+        alertLevel: String(level || "").trim(),
+        url: String(url || "").trim(),
+      },
+    };
+  } catch (err) {
+    console.warn("⚠️ normalizeGdacsFeature failed:", err.message);
+    return null;
+  }
+}
+
+async function fetchGdacsAlerts() {
+  if (!GDACS_ENABLED) return;
+
+  console.log("🌐 Fetching GDACS (global disasters)...");
+  try {
+    const url =
+      `${GDACS_EVENTS_URL}?` +
+      `eventtypes=${encodeURIComponent(GDACS_EVENTTYPES.join(","))}`;
+
+    const res = await axios.get(url, { timeout: 20000 });
+    const data = res.data || {};
+    const features = Array.isArray(data.features) ? data.features : [];
+
+    const cutoff = new Date(Date.now() - GDACS_LOOKBACK_HOURS * 60 * 60 * 1000);
+
+    const out = [];
+    for (const f of features) {
+      const a = normalizeGdacsFeature(f);
+      if (!a) continue;
+      if (a.sent && a.sent < cutoff) continue;
+      out.push(a);
+      if (GDACS_MAX_SAVE > 0 && out.length >= GDACS_MAX_SAVE) break;
+    }
+
+    const usable = out.filter((a) => a.hasGeometry).length;
+    console.log(`✅ Parsed ${out.length} alerts from GDACS (${usable} usable geo)`);
+    if (out.length) await saveAlerts(out);
+  } catch (err) {
+    console.error("❌ Error fetching GDACS:", err.message);
+  }
+}
+
+// Meteoalarm fallback centroids (used only if feed has no GeoRSS geometry)
+const METEO_COUNTRY_CENTROIDS = {
+  AL: [20.0, 41.0],
+  AD: [1.6, 42.5],
+  AT: [14.0, 47.5],
+  BE: [4.5, 50.8],
+  BA: [17.8, 44.2],
+  BG: [25.5, 42.7],
+  BY: [28.0, 53.7],
+  CH: [8.2, 46.8],
+  CY: [33.0, 35.0],
+  CZ: [15.5, 49.8],
+  DE: [10.5, 51.2],
+  DK: [9.5, 56.0],
+  EE: [25.0, 58.6],
+  ES: [-3.7, 40.4],
+  FI: [26.0, 64.0],
+  FR: [2.2, 46.2],
+  GB: [-2.5, 54.0],
+  GR: [22.0, 39.0],
+  HR: [16.4, 45.1],
+  HU: [19.0, 47.1],
+  IE: [-8.0, 53.3],
+  IS: [-19.0, 64.9],
+  IT: [12.5, 42.8],
+  LT: [24.0, 55.3],
+  LU: [6.1, 49.8],
+  LV: [25.0, 56.9],
+  MD: [28.7, 47.2],
+  ME: [19.3, 42.7],
+  MK: [21.7, 41.6],
+  MT: [14.4, 35.9],
+  NL: [5.3, 52.1],
+  NO: [8.4, 60.5],
+  PL: [19.1, 52.1],
+  PT: [-8.0, 39.5],
+  RO: [25.0, 45.9],
+  RS: [21.0, 44.0],
+  SE: [15.0, 62.0],
+  SI: [14.9, 46.1],
+  SK: [19.7, 48.7],
+  TR: [35.0, 39.0],
+  UA: [31.0, 49.0],
+};
+
+const METEO_COUNTRY_NAMES = Object.entries({
+  "united kingdom": "GB",
+  uk: "GB",
+  britain: "GB",
+  england: "GB",
+  scotland: "GB",
+  wales: "GB",
+  "northern ireland": "GB",
+
+  ireland: "IE",
+  iceland: "IS",
+  norway: "NO",
+  sweden: "SE",
+  finland: "FI",
+  denmark: "DK",
+  netherlands: "NL",
+  belgium: "BE",
+  luxembourg: "LU",
+  france: "FR",
+  germany: "DE",
+  deutschland: "DE",
+  switzerland: "CH",
+  austria: "AT",
+  italy: "IT",
+  spain: "ES",
+  portugal: "PT",
+  greece: "GR",
+  turkey: "TR",
+  poland: "PL",
+  czechia: "CZ",
+  "czech republic": "CZ",
+  slovakia: "SK",
+  hungary: "HU",
+  romania: "RO",
+  bulgaria: "BG",
+  croatia: "HR",
+  slovenia: "SI",
+  serbia: "RS",
+  "bosnia": "BA",
+  "bosnia and herzegovina": "BA",
+  montenegro: "ME",
+  albania: "AL",
+  "north macedonia": "MK",
+  macedonia: "MK",
+  moldova: "MD",
+  ukraine: "UA",
+  belarus: "BY",
+  cyprus: "CY",
+  malta: "MT",
+  andorra: "AD",
+}).sort((a, b) => b[0].length - a[0].length);
+
+function inferMeteoCountryPoint(text) {
+  const s = String(text || "").toLowerCase();
+  for (const [name, iso2] of METEO_COUNTRY_NAMES) {
+    if (s.includes(name)) {
+      const pt = METEO_COUNTRY_CENTROIDS[iso2];
+      if (pt && pt.length >= 2) return pt;
+    }
+  }
+  return null;
+}
+
+function parseGeoRssPoint(s) {
+  if (!s || typeof s !== "string") return null;
+  const parts = s.trim().split(/\s+/).map(Number);
+  if (parts.length < 2 || !Number.isFinite(parts[0]) || !Number.isFinite(parts[1])) return null;
+
+  // GeoRSS is usually "lat lon"
+  const a = parts[0];
+  const b = parts[1];
+
+  // If first looks like lon (abs>90) and second looks like lat, swap.
+  const lat = Math.abs(a) <= 90 && Math.abs(b) <= 180 ? a : b;
+  const lon = Math.abs(a) <= 90 && Math.abs(b) <= 180 ? b : a;
+
+  const geom = sanitizePointGeometry({ type: "Point", coordinates: [lon, lat] });
+  return geom || null;
+}
+
+function meteoSeverityFromText(text) {
+  const s = String(text || "").toLowerCase();
+  // Meteoalarm color scheme: yellow/orange/red (sometimes green)
+  if (/\bred\b/.test(s)) return "Extreme";
+  if (/\borange\b/.test(s)) return "Severe";
+  if (/\byellow\b/.test(s)) return "Moderate";
+  if (/\bgreen\b/.test(s)) return "Minor";
+  return "Unknown";
+}
+
+const METEO_HAZARD_PATTERNS = [
+  { label: "Flood", re: /\b(flood|flash flood|inundat|river)\b/i },
+  { label: "Severe storm", re: /\b(thunderstorm|severe weather|storm|hail)\b/i },
+  { label: "High wind", re: /\b(wind|gale|gust)\b/i },
+  { label: "Winter storm", re: /\b(snow|blizzard|ice|freezing rain|winter storm)\b/i },
+  { label: "Heat", re: /\b(heat|heatwave|extreme heat)\b/i },
+  { label: "Wildfire", re: /\b(wild ?fire|forest fire|smoke)\b/i },
+  { label: "Rain", re: /\b(heavy rain|rainfall)\b/i },
+];
+
+function meteoHazardFromText(text) {
+  const s = String(text || "");
+  for (const { label, re } of METEO_HAZARD_PATTERNS) {
+    if (re.test(s)) return label;
+  }
+  return null;
+}
+
+function pickFirstLink(obj) {
+  if (!obj) return "";
+  if (typeof obj === "string") return obj.trim();
+
+  // Atom: link can be array of objects with @_href
+  if (Array.isArray(obj)) {
+    for (const l of obj) {
+      const href = l?.["@_href"] || l?.href || "";
+      if (href) return String(href).trim();
+    }
+    // Or array of strings
+    for (const l of obj) if (typeof l === "string" && l.trim()) return l.trim();
+    return "";
+  }
+
+  const href = obj?.["@_href"] || obj?.href || "";
+  return href ? String(href).trim() : "";
+}
+
+function textField(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return textField(v[0]);
+  if (typeof v === "object" && v["#text"]) return String(v["#text"]);
+  return "";
+}
+
+function normalizeMeteoItem(item, isAtom = false) {
+  try {
+    const title = textField(item?.title).trim();
+    const description = textField(item?.description || item?.summary || item?.content).trim();
+    const link = pickFirstLink(item?.link) || textField(item?.guid).trim();
+
+    if (!title && !link) return null;
+
+    const publishedRaw = item?.pubDate || item?.published || item?.updated;
+    const sent = parseDateMaybe(publishedRaw || Date.now());
+
+    const severity = meteoSeverityFromText(`${title} ${description}`);
+    if (SKIP_MINOR_ALERTS && isMinorSeverity(severity)) return null;
+
+    // Marine filter (best-effort)
+    if (shouldSkipMarineAlert(title, description, [])) return null;
+
+    // GeoRSS point/polygon (if present)
+    let geometry = null;
+    let geometryMethod = null;
+    let bbox = null;
+
+    // With removeNSPrefix:true, georss:point becomes "point"
+    const ptStr = textField(item?.point);
+    if (ptStr) {
+      const g = parseGeoRssPoint(ptStr);
+      if (g) {
+        geometry = g;
+        geometryMethod = "georss-point";
+        bbox = [g.coordinates[0], g.coordinates[1], g.coordinates[0], g.coordinates[1]];
+      }
+    }
+
+    // Polygon
+    if (!geometry) {
+      const polyStr = textField(item?.polygon);
+      const poly = parsePolygon(polyStr);
+      if (poly) {
+        const c = polygonCentroid(poly);
+        if (c) {
+          geometry = c;
+          geometryMethod = "georss-polygon-centroid";
+          const pts = poly?.coordinates?.[0] || [];
+          bbox = bboxFromPoints(pts);
+        }
+      }
+    }
+
+    // Fallback: infer country centroid from text
+    if (!geometry) {
+      const pt = inferMeteoCountryPoint(`${title} ${description} ${link}`);
+      if (pt) {
+        const g = sanitizePointGeometry({ type: "Point", coordinates: pt });
+        if (g) {
+          geometry = g;
+          geometryMethod = "country-centroid";
+          bbox = [g.coordinates[0], g.coordinates[1], g.coordinates[0], g.coordinates[1]];
+        }
+      }
+    }
+
+    if (!geometry) return null;
+
+    const hazard = meteoHazardFromText(`${title}\n${description}`) || "Weather Warning";
+
+    const headlineText = title || `${hazard} (Meteoalarm)`;
+    const infoBlock = {
+      category: "Met",
+      event: hazard,
+      urgency: "Unknown",
+      severity,
+      certainty: "Unknown",
+      headline: headlineText,
+      description: description || headlineText,
+      instruction: "",
+    };
+
+    const idSeed = link || title || `${sent.toISOString()}|${hash32(headlineText)}`;
+    const identifier = `METEOALARM-${hash32(idSeed)}`;
+
+    const expires = new Date(sent.getTime() + 24 * 60 * 60 * 1000);
+
+    return {
+      identifier,
+      sender: "Meteoalarm",
+      sent,
+      status: "Actual",
+      msgType: "Alert",
+      scope: "Public",
+      info: infoBlock,
+      area: { areaDesc: "", polygon: null },
+      geometry,
+      geometryMethod,
+      bbox,
+      hasGeometry: true,
+      title: headlineText,
+      summary: (description || "").slice(0, 5000),
+      source: "Meteoalarm",
+      timestamp: new Date(),
+      expires,
+      meteoalarm: {
+        link,
+        isAtom: !!isAtom,
+      },
+    };
+  } catch (err) {
+    console.warn("⚠️ normalizeMeteoItem failed:", err.message);
+    return null;
+  }
+}
+
+async function fetchMeteoalarmWarnings() {
+  if (!METEOALARM_ENABLED) return;
+
+  console.log("🌐 Fetching Meteoalarm (EU warnings)...");
+  try {
+    const res = await axios.get(METEOALARM_FEED_URL, { timeout: 20000 });
+    const xml = res.data;
+
+    const parser = new XMLParser({
+      ignoreAttributes: false,
+      removeNSPrefix: true,
+      attributeNamePrefix: "@_",
+      trimValues: true,
+      isArray: (tagName) => tagName === "item" || tagName === "entry" || tagName === "link",
+    });
+
+    const json = parser.parse(xml) || {};
+
+    // RSS
+    let items = json?.rss?.channel?.item;
+    let isAtom = false;
+
+    // Atom
+    if (!items) {
+      items = json?.feed?.entry;
+      isAtom = true;
+    }
+
+    if (!items) {
+      console.warn("⚠️ Meteoalarm feed parsed but found no items/entries");
+      return;
+    }
+
+    if (!Array.isArray(items)) items = [items];
+
+    const out = [];
+    for (const it of items) {
+      const a = normalizeMeteoItem(it, isAtom);
+      if (!a) continue;
+      out.push(a);
+      if (METEOALARM_MAX_SAVE > 0 && out.length >= METEOALARM_MAX_SAVE) break;
+    }
+
+    const usable = out.filter((a) => a.hasGeometry).length;
+    console.log(`✅ Parsed ${out.length} alerts from Meteoalarm (${usable} usable geo)`);
+    if (out.length) await saveAlerts(out);
+  } catch (err) {
+    console.error("❌ Error fetching Meteoalarm:", err.message);
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  CAP-STYLE NORMALIZATION (FEMA / USGS)                             */
 /* ------------------------------------------------------------------ */
 
@@ -1106,9 +1685,16 @@ function normalizeCapAlert(entry, feed) {
         info["georss:point"];
       if (typeof pointStr === "string") {
         const parts = pointStr.trim().split(/\s+/).map(Number);
-        if (parts.length >= 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1])) {
+        if (
+          parts.length >= 2 &&
+          Number.isFinite(parts[0]) &&
+          Number.isFinite(parts[1])
+        ) {
           const [lat, lon] = parts;
-          geometry = sanitizePointGeometry({ type: "Point", coordinates: [lon, lat] });
+          geometry = sanitizePointGeometry({
+            type: "Point",
+            coordinates: [lon, lat],
+          });
           geometryMethod = "georss-point";
         }
       }
@@ -1119,7 +1705,10 @@ function normalizeCapAlert(entry, feed) {
       const lat = Number(info.lat || area.lat || root.lat);
       const lon = Number(info.lon || area.lon || root.lon);
       if (Number.isFinite(lat) && Number.isFinite(lon)) {
-        geometry = sanitizePointGeometry({ type: "Point", coordinates: [lon, lat] });
+        geometry = sanitizePointGeometry({
+          type: "Point",
+          coordinates: [lon, lat],
+        });
         geometryMethod = "explicit-latlon";
       }
     }
@@ -1361,7 +1950,7 @@ async function normalizeNoaaAlert(feature) {
       geometryMethod = `noaa-geom-${String(feature.geometry?.type || "geom").toLowerCase()}`;
     }
 
-    // 2) ✅ Zone geometry centroid(s) (affectedZones + UGC)
+    // 2) Zone geometry centroid(s) (affectedZones + UGC)
     if (!geometry) {
       const hit = await centroidFromNoaaZones(props);
       if (hit?.geometry) {
@@ -1600,7 +2189,7 @@ async function fetchNoaaAlerts() {
     const data = res.data || {};
     const features = Array.isArray(data.features) ? data.features : [];
 
-    // ✅ Prefetch zones (concurrency-limited) for alerts lacking geometry
+    // Prefetch zones (concurrency-limited) for alerts lacking geometry
     await prefetchZonesForFeatures(features);
 
     const alerts = [];
@@ -1650,10 +2239,14 @@ async function pollCapFeeds() {
     console.error("⚠️ TTL cleanup failed:", err.message);
   }
 
-  // 1) NOAA Weather API
+  // 1) NOAA Weather API (US + territories)
   await fetchNoaaAlerts();
 
-  // 2) FEMA + USGS
+  // 2) Global feeds (optional)
+  await fetchGdacsAlerts();
+  await fetchMeteoalarmWarnings();
+
+  // 3) FEMA + USGS
   for (const feed of CAP_FEEDS) {
     await fetchCapFeed(feed);
   }
