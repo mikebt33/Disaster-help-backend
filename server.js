@@ -135,6 +135,39 @@ try {
   console.warn("⚠️ hazards schema validation skipped or failed:", e.message);
 }
 
+// 4️⃣-b Schema validation — alerts_cap (global alerts support)
+try {
+  await db.command({
+    collMod: "alerts_cap",
+    validator: {
+      $jsonSchema: {
+        bsonType: "object",
+        required: ["geometry"],
+        properties: {
+          geometry: {
+            bsonType: "object",
+            required: ["type", "coordinates"],
+            properties: {
+              type: { enum: ["Point"] },
+              coordinates: {
+                bsonType: "array",
+                items: [{ bsonType: "double" }, { bsonType: "double" }],
+                minItems: 2,
+                maxItems: 2
+              }
+            }
+          }
+        }
+      }
+    },
+    validationLevel: "moderate"
+  });
+
+  console.log("✅ Schema validation applied for alerts_cap (global alerts enabled).");
+} catch (e) {
+  console.warn("⚠️ alerts_cap schema validation skipped or failed:", e.message);
+}
+
 // 5️⃣ Social/news TTL + geo indexes
 await ensureIndexes();
 console.log("✅ Social/news indexes ensured");
