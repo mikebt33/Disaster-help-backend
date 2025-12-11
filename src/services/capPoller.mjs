@@ -1091,7 +1091,11 @@ function centroidFromGeoJSONGeometry(geom) {
   // Prefer Point directly.
   if (geom.type === "Point" && Array.isArray(geom.coordinates)) {
     const g = sanitizePointGeometry({ type: "Point", coordinates: geom.coordinates });
-    return { geometry: g, bbox: g ? [g.coordinates[0], g.coordinates[1], g.coordinates[0], g.coordinates[1]] : null, method: "geojson-point" };
+    return {
+      geometry: g,
+      bbox: g ? [g.coordinates[0], g.coordinates[1], g.coordinates[0], g.coordinates[1]] : null,
+      method: "geojson-point",
+    };
   }
 
   // Otherwise centroid from all points.
@@ -1100,7 +1104,11 @@ function centroidFromGeoJSONGeometry(geom) {
 
   const geometry = pointsCentroid(pts);
   const bbox = bboxFromPoints(pts);
-  return { geometry, bbox, method: `geojson-${String(geom.type || "geom").toLowerCase()}` };
+  return {
+    geometry,
+    bbox,
+    method: `geojson-${String(geom.type || "geom").toLowerCase()}`,
+  };
 }
 
 function normalizeGdacsFeature(feature) {
@@ -1331,7 +1339,7 @@ const METEO_COUNTRY_NAMES = Object.entries({
   croatia: "HR",
   slovenia: "SI",
   serbia: "RS",
-  "bosnia": "BA",
+  bosnia: "BA",
   "bosnia and herzegovina": "BA",
   montenegro: "ME",
   albania: "AL",
@@ -1526,9 +1534,12 @@ function normalizeMeteoItem(item, isAtom = false) {
       title: headlineText,
       summary: (description || "").slice(0, 5000),
       source: "Meteoalarm",
-      timestamp: new Date(),   // <-- ADD THIS
+      timestamp: new Date(), // required for DB schema
       expires,
-      meteoalarm: { ... }
+      meteoalarm: {
+        link,
+        isAtom: !!isAtom,
+      },
     };
   } catch (err) {
     console.warn("⚠️ normalizeMeteoItem failed:", err.message);
@@ -1549,7 +1560,8 @@ async function fetchMeteoalarmWarnings() {
       removeNSPrefix: true,
       attributeNamePrefix: "@_",
       trimValues: true,
-      isArray: (tagName) => tagName === "item" || tagName === "entry" || tagName === "link",
+      isArray: (tagName) =>
+        tagName === "item" || tagName === "entry" || tagName === "link",
     });
 
     const json = parser.parse(xml) || {};
