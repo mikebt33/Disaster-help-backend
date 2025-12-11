@@ -1439,37 +1439,105 @@ function textField(v) {
 function normalizeMeteoItem(item, isAtom = false) {
   try {
     const title = textField(item?.title).trim();
-    const description = textField(item?.description || item?.summary || item?.content).trim();
-    const link = pickFirstLink(item?.link) || textField(item?.guid).trim();
+    const rawDescription = textField(
+      item?.description || item?.summary || item?.content
+    ).trim();
 
+    const link = pickFirstLink(item?.link) || textField(item?.guid).trim();
     if (!title && !link) return null;
 
     const publishedRaw = item?.pubDate || item?.published || item?.updated;
     const sent = parseDateMaybe(publishedRaw || Date.now());
 
-    const severity = meteoSeverityFromText(`${title} ${description}`);
-    if (SKIP_MINOR_ALERTS && isMinorSeverity(severity)) return null;
+    // ---- 1) Extract hazard + severity from HTML metadata ----
+    const AWARENESS_TYPE_RE = /data-awareness-type="(\d+)"/gi;
+    const AWARENESS_LEVEL_RE = /data-awareness-level="(\d+)"/gi;
 
-    // Marine filter (best-effort)
-    if (shouldSkipMarineAlert(title, description, [])) return null;
+    const hazardTypes = [];
+    const severities = [];
 
-    // GeoRSS point/polygon (if present)
+    let m;
+
+    while ((m = AWARENESS_TYPE_RE.exec(rawDescription))) {
+      hazardTypes.push(Number(m[1]));
+    }
+
+    while ((m = AWARENESS_LEVEL_RE.exec(rawDescription))) {
+      severities.push(Number(m[1]));
+    }
+
+    // pick highest severity
+    const severityCode = severities.length ? Math.max(...severities) : null;
+    const hazardCode = hazardTypes.length ? hazardTypes[0] : null;
+
+    // Map hazard types
+    const HAZARD_MAP = {
+      12: "Windstorm",
+      11: "Thunderstorm",
+      10: "Fog",
+      9: "Extreme Cold",
+      8: "Extreme Heat",
+      7: "Heavy Rain",
+      6: "Snow / Ice",
+      5: "Avalanche",
+      4: "Coastal Event",
+      3: "Forest Fire",
+      2: "Snowfall",
+      1: "General Weather Warning",
+    };
+
+    const hazardLabel = HAZARD_MAP[hazardCode] || "Weather Warning";
+
+    // Map severity level
+    let severity = "Unknown";
+    if (severityCode === 4) severity = "Extreme";
+    else if (severityCode === 3) severity = "Severe";
+    else if (severityCode === 2) severity = "Moderate";
+    else if (severityCode === 1) severity = "Minor";
+
+    if (SKIP_MINOR_ALERTS && severity === "Minor") return null;
+
+    // ---- 2) Extract time periods ----
+    const TIME_RE = /From:\s*<\/b><i>([^<]+)<\/i><b>.*?Until:\s*<\/b><i>([^<]+)<\/i>/g;
+
+    const periods = [];
+    while ((m = TIME_RE.exec(rawDescription))) {
+      periods.push({
+        from: parseDateMaybe(m[1]),
+        until: parseDateMaybe(m[2]),
+      });
+    }
+
+    // Build readable description
+    let cleanDescription = "";
+
+    if (periods.length) {
+      cleanDescription += "Time Periods:\n";
+      for (const p of periods) {
+        cleanDescription += `• From ${p.from.toISOString()} to ${p.until.toISOString()}\n`;
+      }
+    }
+
+    const stripped = rawDescription
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    cleanDescription += `\nDetails: ${stripped}`.trim();
+
+    // ---- 3) Geometry handling ----
     let geometry = null;
     let geometryMethod = null;
-    let bbox = null;
 
-    // With removeNSPrefix:true, georss:point becomes "point"
     const ptStr = textField(item?.point);
     if (ptStr) {
       const g = parseGeoRssPoint(ptStr);
       if (g) {
         geometry = g;
         geometryMethod = "georss-point";
-        bbox = [g.coordinates[0], g.coordinates[1], g.coordinates[0], g.coordinates[1]];
       }
     }
 
-    // Polygon
     if (!geometry) {
       const polyStr = textField(item?.polygon);
       const poly = parsePolygon(polyStr);
@@ -1477,46 +1545,43 @@ function normalizeMeteoItem(item, isAtom = false) {
         const c = polygonCentroid(poly);
         if (c) {
           geometry = c;
-          geometryMethod = "georss-polygon-centroid";
-          const pts = poly?.coordinates?.[0] || [];
-          bbox = bboxFromPoints(pts);
+          geometryMethod = "georss-polygon";
         }
       }
     }
 
-    // Fallback: infer country centroid from text
     if (!geometry) {
-      const pt = inferMeteoCountryPoint(`${title} ${description} ${link}`);
+      const pt = inferMeteoCountryPoint(`${title} ${rawDescription} ${link}`);
       if (pt) {
         const g = sanitizePointGeometry({ type: "Point", coordinates: pt });
         if (g) {
           geometry = g;
           geometryMethod = "country-centroid";
-          bbox = [g.coordinates[0], g.coordinates[1], g.coordinates[0], g.coordinates[1]];
         }
       }
     }
 
     if (!geometry) return null;
 
-    const hazard = meteoHazardFromText(`${title}\n${description}`) || "Weather Warning";
-
-    const headlineText = title || `${hazard} (Meteoalarm)`;
-    const infoBlock = {
-      category: "Met",
-      event: hazard,
-      urgency: "Unknown",
-      severity,
-      certainty: "Unknown",
-      headline: headlineText,
-      description: description || headlineText,
-      instruction: "",
-    };
-
-    const idSeed = link || title || `${sent.toISOString()}|${hash32(headlineText)}`;
+    // ---- 4) Final alert fields ----
+    const idSeed = link || title || `${sent.toISOString()}|${hash32(title)}`;
     const identifier = `METEOALARM-${hash32(idSeed)}`;
 
-    const expires = new Date(sent.getTime() + 24 * 60 * 60 * 1000);
+    const expires =
+      periods.length > 0
+        ? periods[periods.length - 1].until
+        : new Date(sent.getTime() + 24 * 60 * 60 * 1000);
+
+    const infoBlock = {
+      category: "Met",
+      event: hazardLabel,
+      urgency: "Unknown",
+      severity,
+      certainty: "Observed",
+      headline: `${severity} ${hazardLabel}`,
+      description: cleanDescription,
+      instruction: "",
+    };
 
     return {
       identifier,
@@ -1526,19 +1591,29 @@ function normalizeMeteoItem(item, isAtom = false) {
       msgType: "Alert",
       scope: "Public",
       info: infoBlock,
-      area: { areaDesc: "", polygon: null },
+
+      area: {
+        areaDesc: title,
+        polygon: null,
+      },
+
       geometry,
       geometryMethod,
-      bbox,
+      bbox: null,
       hasGeometry: true,
-      title: headlineText,
-      summary: (description || "").slice(0, 5000),
+
+      title: `${severity} ${hazardLabel}`,
+      summary: cleanDescription.slice(0, 500),
+
       source: "Meteoalarm",
-      timestamp: new Date(), // required for DB schema
+      timestamp: new Date(),
       expires,
+
       meteoalarm: {
         link,
-        isAtom: !!isAtom,
+        hazardCode,
+        severityCode,
+        periods,
       },
     };
   } catch (err) {
