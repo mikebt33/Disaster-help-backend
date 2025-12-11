@@ -1449,24 +1449,21 @@ function normalizeMeteoItem(item, isAtom = false) {
     const publishedRaw = item?.pubDate || item?.published || item?.updated;
     const sent = parseDateMaybe(publishedRaw || Date.now());
 
-    // ---- 1) Extract hazard + severity from HTML ----
-    const AWARENESS_TYPE_RE = /data-awareness-type="(\d+)"/gi;
-    const AWARENESS_LEVEL_RE = /data-awareness-level="(\d+)"/gi;
+    // ------------------------------
+    // 1) Extract hazard/severity
+    // ------------------------------
+    const TYPE_RE = /data-awareness-type="(\d+)"/gi;
+    const LEVEL_RE = /data-awareness-level="(\d+)"/gi;
 
-    const hazardTypes = [];
-    const severities = [];
+    const types = [];
+    const levels = [];
     let m;
 
-    while ((m = AWARENESS_TYPE_RE.exec(rawDescription))) {
-      hazardTypes.push(Number(m[1]));
-    }
+    while ((m = TYPE_RE.exec(rawDescription))) types.push(Number(m[1]));
+    while ((m = LEVEL_RE.exec(rawDescription))) levels.push(Number(m[1]));
 
-    while ((m = AWARENESS_LEVEL_RE.exec(rawDescription))) {
-      severities.push(Number(m[1]));
-    }
-
-    const hazardCode = hazardTypes.length ? hazardTypes[0] : null;
-    const severityCode = severities.length ? Math.max(...severities) : null;
+    const hazardCode = types.length ? types[0] : null;
+    const severityCode = levels.length ? Math.max(...levels) : null;
 
     const HAZARD_MAP = {
       12: "Windstorm",
@@ -1493,79 +1490,59 @@ function normalizeMeteoItem(item, isAtom = false) {
 
     if (SKIP_MINOR_ALERTS && severity === "Minor") return null;
 
-    // ---- 2) Extract time periods (From → Until) ----
-    const TIME_RE =
-      /From:\s*<\/b><i>([^<]+)<\/i><b>.*?Until:\s*<\/b><i>([^<]+)<\/i>/g;
+    // ------------------------------
+    // 2) Extract and collapse periods
+    // ------------------------------
+    const TIME_RE = /From:\s*<\/b><i>([^<]+)<\/i><b>.*?Until:\s*<\/b><i>([^<]+)<\/i>/g;
 
-    const periods = [];
+    const rawPeriods = [];
     while ((m = TIME_RE.exec(rawDescription))) {
-      periods.push({
+      rawPeriods.push({
         from: parseDateMaybe(m[1]),
-        until: parseDateMaybe(m[2]),
+        until: parseDateMaybe(m[2])
       });
     }
 
-    // ---- Deduplicate periods ----
-    const uniquePeriods = [];
-    const seen = new Set();
-    for (const p of periods) {
-      const key = p.from.toISOString() + "|" + p.until.toISOString();
-      if (!seen.has(key)) {
-        seen.add(key);
-        uniquePeriods.push(p);
+    // Sort by start time
+    rawPeriods.sort((a, b) => a.from - b.from);
+
+    // Merge overlapping periods → produce clean single windows
+    const merged = [];
+    for (const p of rawPeriods) {
+      if (!merged.length) {
+        merged.push({ ...p });
+      } else {
+        const last = merged[merged.length - 1];
+        if (p.from <= last.until) {
+          // overlap → extend
+          last.until = new Date(Math.max(last.until, p.until));
+        } else {
+          merged.push({ ...p });
+        }
       }
     }
 
-    // ---- 3) Build clean human-readable description ----
-    let cleanDescription = "";
+    // Limit to max 2 clean windows; more adds noise
+    const displayPeriods = merged.slice(0, 2);
 
-    if (uniquePeriods.length) {
-      cleanDescription += "Affected Periods:\n";
-      for (const p of uniquePeriods) {
-        const from = p.from.toLocaleString("en-US", {
-          weekday: "short",
-          day: "2-digit",
-          month: "short",
-          year: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-        });
+    // Build clean readable description blocks
+    const formattedPeriods = displayPeriods
+      .map(p => {
+        return `• ${p.from.toUTCString().replace(" GMT", "")} → ${p.until
+          .toUTCString()
+          .replace(" GMT", "")}`;
+      })
+      .join("\n");
 
-        const until = p.until.toLocaleString("en-US", {
-          weekday: "short",
-          day: "2-digit",
-          month: "short",
-          year: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-        });
+    // Extract 1-sentence details from title/description
+    const STRIP_HTML = rawDescription.replace(/<[^>]*>/g, " ").trim();
+    const CLEAN_DETAILS = (
+      `${severity} ${hazardLabel} expected.` // fallback
+    );
 
-        cleanDescription += `• ${from} → ${until}\n`;
-      }
-    }
-
-    // Remove HTML + noise
-    let stripped = rawDescription
-      .replace(/<[^>]*>/g, " ")
-      .replace(/\bawt:\d+\b/gi, "")
-      .replace(/\blevel:\d+\b/gi, "")
-      .replace(/\btoday\b.*?(?=\bfrom\b)/gi, "")
-      .replace(/\btomorrow\b.*?(?=\bfrom\b)/gi, "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    // Try to extract meaningful weather sentence
-    const SHORT_DESC_RE =
-      /(hazardous.*?\.|warning.*?\.|conditions.*?\.|expected.*?\.)/i;
-
-    const mShort = stripped.match(SHORT_DESC_RE);
-    const meaningful =
-      (mShort && mShort[0].trim()) ||
-      `${severity} ${hazardLabel} expected.`; // fallback sentence
-
-    cleanDescription += `\n${meaningful}`.trim();
-
-    // ---- 4) Geometry handling ----
+    // ------------------------------
+    // 3) Geometry
+    // ------------------------------
     let geometry = null;
     let geometryMethod = null;
 
@@ -1603,14 +1580,19 @@ function normalizeMeteoItem(item, isAtom = false) {
 
     if (!geometry) return null;
 
-    // ---- 5) Final normalized object ----
-    const idSeed = link || title || `${sent.toISOString()}|${hash32(title)}`;
-    const identifier = `METEOALARM-${hash32(idSeed)}`;
-
+    // ------------------------------
+    // 4) Choose final expiration
+    // ------------------------------
     const expires =
-      uniquePeriods.length > 0
-        ? uniquePeriods[uniquePeriods.length - 1].until
-        : new Date(sent.getTime() + 24 * 60 * 60 * 1000);
+      merged.length > 0
+        ? merged[merged.length - 1].until
+        : new Date(sent.getTime() + 24 * 3600 * 1000);
+
+    // ------------------------------
+    // 5) Assemble final clean alert
+    // ------------------------------
+    const idSeed = link || `${sent.toISOString()}|${hash32(title)}`;
+    const identifier = `METEOALARM-${hash32(idSeed)}`;
 
     const infoBlock = {
       category: "Met",
@@ -1619,7 +1601,11 @@ function normalizeMeteoItem(item, isAtom = false) {
       severity,
       certainty: "Likely",
       headline: `${severity} ${hazardLabel}`,
-      description: cleanDescription,
+      description:
+        (displayPeriods.length
+          ? `Affected Periods:\n${formattedPeriods}\n\n`
+          : ``) +
+        CLEAN_DETAILS,
       instruction: "",
     };
 
@@ -1632,10 +1618,8 @@ function normalizeMeteoItem(item, isAtom = false) {
       scope: "Public",
 
       info: infoBlock,
-      area: {
-        areaDesc: title,
-        polygon: null,
-      },
+
+      area: { areaDesc: title, polygon: null },
 
       geometry,
       geometryMethod,
@@ -1643,7 +1627,7 @@ function normalizeMeteoItem(item, isAtom = false) {
       hasGeometry: true,
 
       title: `${severity} ${hazardLabel}`,
-      summary: meaningful,
+      summary: CLEAN_DETAILS,
 
       source: "Meteoalarm",
       timestamp: new Date(),
@@ -1653,11 +1637,11 @@ function normalizeMeteoItem(item, isAtom = false) {
         link,
         hazardCode,
         severityCode,
-        periods: uniquePeriods,
-      },
+        mergedPeriods: merged
+      }
     };
   } catch (err) {
-    console.warn("⚠️ normalizeMeteoItem failed:", err.message);
+    console.warn("⚠️ normalizeMeteoItem (clean) failed:", err.message);
     return null;
   }
 }
