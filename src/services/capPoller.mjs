@@ -1526,12 +1526,9 @@ function normalizeMeteoItem(item, isAtom = false) {
       title: headlineText,
       summary: (description || "").slice(0, 5000),
       source: "Meteoalarm",
-      timestamp: new Date(),
+      timestamp: new Date(),   // <-- ADD THIS
       expires,
-      meteoalarm: {
-        link,
-        isAtom: !!isAtom,
-      },
+      meteoalarm: { ... }
     };
   } catch (err) {
     console.warn("⚠️ normalizeMeteoItem failed:", err.message);

@@ -16,7 +16,7 @@ import readline from "readline";
 import { getDB } from "../db.js";
 
 // ---------------------------------------------------------------------------
-// CONFIG — **THIS IS THE FIX**
+// CONFIG
 // ---------------------------------------------------------------------------
 
 // MUST load lastupdate.txt from storage.googleapis.com (TLS-safe)
@@ -28,10 +28,12 @@ const USER_AGENT =
 
 // rewrite ZIP URLs from data.gdeltproject.org → storage.googleapis.com
 function rewriteGdeltUrl(url) {
-  return url.replace(
-    /^https?:\/\/data\.gdeltproject\.org\//i,
-    "https://storage.googleapis.com/data.gdeltproject.org/"
-  );
+  // handle both http/https and ensure gdeltv2 path is preserved
+  return url
+    .replace(
+      /^https?:\/\/data\.gdeltproject\.org\//i,
+      "https://storage.googleapis.com/data.gdeltproject.org/"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +102,22 @@ const TTL_MS = TTL_HOURS * 3600 * 1000;
 const MAX_SAVE = Number(process.env.GDELT_MAX_SAVE) || 400;
 const BATCH_SIZE = Number(process.env.GDELT_BATCH_SIZE) || 250;
 
+// helper: extract domain from URL
+function getDomain(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+// helper: check if domain should be blocked
+function isBlocked(domain) {
+  if (!domain) return true;
+  const d = domain.toLowerCase();
+  return BLOCKED_DOMAIN_SUBSTRINGS.some((b) => d.includes(b));
+}
+
 // ---------------------------------------------------------------------------
 // Hazard boosting — roots + event codes + text patterns
 // ---------------------------------------------------------------------------
@@ -116,7 +134,15 @@ const HAZARD_ROOTCODES = new Set([
   "20",
 ]);
 
-const HAZARD_EVENTCODES = new Set(["102", "103", "190", "191", "193", "194", "195"]);
+const HAZARD_EVENTCODES = new Set([
+  "102",
+  "103",
+  "190",
+  "191",
+  "193",
+  "194",
+  "195",
+]);
 
 const HAZARD_PATTERNS = [
   { label: "Tornado", re: /\b(tornado|twister|waterspout)\b/i },
@@ -149,7 +175,15 @@ function detectHazardFromText(t) {
   return null;
 }
 
-function classifyHazard({ actor1, actor2, place, url, domain, eventCode, rootCode }) {
+function classifyHazard({
+  actor1,
+  actor2,
+  place,
+  url,
+  domain,
+  eventCode,
+  rootCode,
+}) {
   const text = [actor1, actor2, place, url, domain]
     .join(" ")
     .replace(/[-_/]+/g, " ")
@@ -171,7 +205,14 @@ function classifyHazard({ actor1, actor2, place, url, domain, eventCode, rootCod
 // ---------------------------------------------------------------------------
 
 function validLonLat(lon, lat) {
-  return Number.isFinite(lon) && Number.isFinite(lat) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+  return (
+    Number.isFinite(lon) &&
+    Number.isFinite(lat) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lon >= -180 &&
+    lon <= 180
+  );
 }
 
 function pickGeo(cols) {
@@ -317,7 +358,7 @@ export async function pollGDELT() {
     const db = getDB();
     const col = db.collection("social_signals");
 
-    // TTL cleanup
+    // TTL cleanup for GDELT docs only
     await col.deleteMany({ source: "GDELT", expires: { $lte: now } });
 
     let bulk = [];
@@ -392,7 +433,9 @@ export async function pollGDELT() {
         url,
 
         title: `${hazardLabel} near ${place || "Unknown location"}`,
-        description: `${hazardLabel} reported near ${place || "Unknown location"}.`,
+        description: `${hazardLabel} reported near ${
+          place || "Unknown location"
+        }.`,
 
         publishedAt,
         updatedAt: now,
