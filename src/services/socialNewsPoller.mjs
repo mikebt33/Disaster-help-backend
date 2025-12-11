@@ -1,13 +1,19 @@
-// news/socialNewsPoller.mjs — Option B (Recommended MVP)
-// -------------------------------------------------------
-// Major improvements vs your previous version:
-// • Regional fallback (Plains, Midwest, Southeast, Gulf Coast, etc.)
-// • State-only fallback now triggers placement reliably
-// • Far improved hazard context detection
-// • Wider NewsAPI yield — without noise
-// • Deterministic jitter to avoid stacking
-// • Guaranteed clean GeoJSON geometry
-// • US-only signals, but much easier to match
+// src/services/socialNewsPoller.mjs
+// ------------------------------------------------------------
+// SOCIAL NEWS POLLER — MAXIMUM SIGNALS MODE (OPTION A)
+// ------------------------------------------------------------
+// This is your high-volume hazard intelligence pipeline:
+//  • Accepts broad, regional, and statewide hazard articles
+//  • Only rejects entertainment / obvious junk
+//  • Strong hazard detection with expanded keyword mappings
+//  • Region + state + county fallbacks for maximum coverage
+//  • Deterministic jitter → no stacking
+//  • Designed to ALWAYS produce news signals for your map
+//
+// Outputs documents into: social_signals
+// { type:"news", provider:"NewsAPI", geometry:{Point}, expires, ... }
+//
+// ------------------------------------------------------------
 
 import axios from "axios";
 import { getDB } from "../db.js";
@@ -21,31 +27,31 @@ const NEWS_API_KEY = process.env.NEWS_API_KEY;
 
 console.log("NEWS_API_KEY loaded:", !!NEWS_API_KEY);
 
-/* ---------------------------------------------------------
-   Load county centers (for county-level precision)
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Load county centers
+// ----------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
 const countyCentersPath = path.resolve(__dirname, "../data/county_centers.json");
 const countyCenters = JSON.parse(fs.readFileSync(countyCentersPath, "utf8"));
 
-/* ---------------------------------------------------------
-   Precompute state centroids
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Build state centroids
+// ----------------------------------------------------
 const STATE_CENTROIDS = {};
 for (const [st, counties] of Object.entries(countyCenters)) {
-  const coords = Object.values(counties).filter((v) => Array.isArray(v));
-  if (coords.length) {
-    STATE_CENTROIDS[st] = [
-      coords.reduce((s, c) => s + c[0], 0) / coords.length, // lon
-      coords.reduce((s, c) => s + c[1], 0) / coords.length, // lat
-    ];
-  }
+  const values = Object.values(counties).filter((v) => Array.isArray(v));
+  if (!values.length) continue;
+  STATE_CENTROIDS[st] = [
+    values.reduce((s, c) => s + c[0], 0) / values.length,
+    values.reduce((s, c) => s + c[1], 0) / values.length,
+  ];
 }
 
-/* ---------------------------------------------------------
-   Regional fallback definitions (Option B upgrade)
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Regions (broad fallback for maximum signals)
+// ----------------------------------------------------
 const REGIONAL_CENTROIDS = {
   "midwest": [-93.5, 42.1],
   "great lakes": [-85.5, 44.0],
@@ -56,288 +62,276 @@ const REGIONAL_CENTROIDS = {
   "southeast": [-82.7, 33.2],
   "gulf coast": [-90.0, 29.0],
   "northeast": [-72.0, 42.7],
+  "mid atlantic": [-76.0, 39.0],
   "pacific northwest": [-121.0, 45.5],
-  "rockies": [-109.5, 43.0],
   "southwest": [-111.5, 34.0],
+  "rockies": [-108.0, 42.0],
+  "california": [-119.3, 36.6],
+  "texas": [-99.1, 31.0],
+  "florida": [-82.5, 27.5],
 };
 
-/* ---------------------------------------------------------
-   US state maps
---------------------------------------------------------- */
+// ----------------------------------------------------
+// State name → code
+// ----------------------------------------------------
 const STATE_NAME_TO_CODE = {
-  alabama: "AL", alaska: "AK", arizona: "AZ", arkansas: "AR",
-  california: "CA", colorado: "CO", connecticut: "CT", delaware: "DE",
-  florida: "FL", georgia: "GA", hawaii: "HI", idaho: "ID", illinois: "IL",
-  indiana: "IN", iowa: "IA", kansas: "KS", kentucky: "KY", louisiana: "LA",
-  maine: "ME", maryland: "MD", massachusetts: "MA", michigan: "MI",
-  minnesota: "MN", mississippi: "MS", missouri: "MO", montana: "MT",
-  nebraska: "NE", nevada: "NV", "new hampshire": "NH", "new jersey": "NJ",
-  "new mexico": "NM", "new york": "NY", "north carolina": "NC",
-  "north dakota": "ND", ohio: "OH", oklahoma: "OK", oregon: "OR",
-  pennsylvania: "PA", "rhode island": "RI", "south carolina": "SC",
-  "south dakota": "SD", tennessee: "TN", texas: "TX", utah: "UT",
-  vermont: "VT", virginia: "VA", washington: "WA", "west virginia": "WV",
-  wisconsin: "WI", wyoming: "WY", "district of columbia": "DC",
+  alabama:"AL", alaska:"AK", arizona:"AZ", arkansas:"AR",
+  california:"CA", colorado:"CO", connecticut:"CT", delaware:"DE",
+  florida:"FL", georgia:"GA", hawaii:"HI", idaho:"ID", illinois:"IL",
+  indiana:"IN", iowa:"IA", kansas:"KS", kentucky:"KY", louisiana:"LA",
+  maine:"ME", maryland:"MD", massachusetts:"MA", michigan:"MI",
+  minnesota:"MN", mississippi:"MS", missouri:"MO", montana:"MT",
+  nebraska:"NE", nevada:"NV", "new hampshire":"NH", "new jersey":"NJ",
+  "new mexico":"NM", "new york":"NY", "north carolina":"NC",
+  "north dakota":"ND", ohio:"OH", oklahoma:"OK", oregon:"OR",
+  pennsylvania:"PA", "rhode island":"RI", "south carolina":"SC",
+  "south dakota":"SD", tennessee:"TN", texas:"TX", utah:"UT",
+  vermont:"VT", virginia:"VA", washington:"WA", "west virginia":"WV",
+  wisconsin:"WI", wyoming:"WY", "district of columbia":"DC",
 };
 
-const STATE_CODES = new Set(Object.values(STATE_NAME_TO_CODE));
-const STATE_NAMES = new Set(Object.keys(STATE_NAME_TO_CODE));
-
-/* ---------------------------------------------------------
-   Hazard keywords
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Hazard dictionary (maximum coverage)
+// ----------------------------------------------------
 const HAZARD_WORDS = [
-  "flash flood", "flood", "tornado", "severe weather", "thunderstorm",
-  "hurricane", "tropical storm", "winter storm", "blizzard",
-  "wildfire", "forest fire",
-  "earthquake", "tsunami",
+  "tornado", "twister", "funnel cloud",
+  "hurricane", "tropical storm", "cyclone",
+  "flash flood", "flood", "inundation",
+  "severe weather", "damaging winds", "strong winds",
+  "thunderstorm", "hail", "microburst", "downburst",
+  "wildfire", "forest fire", "brush fire",
+  "earthquake", "aftershock",
+  "tsunami",
   "landslide", "mudslide",
-  "power outage", "heat wave", "extreme heat",
+  "blizzard", "winter storm", "ice storm",
+  "power outage", "blackout",
+  "extreme heat", "heat wave",
 ];
 
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const HAZARD_RE = new RegExp(
-  "\\b(" + HAZARD_WORDS.sort((a, b) => b.length - a.length).map(esc).join("|") + ")\\b",
-  "gi"
+  "(" + HAZARD_WORDS.sort((a,b)=>b.length-a.length).map(esc).join("|") + ")",
+  "i"
 );
 
-/* ---------------------------------------------------------
-   Query terms for NewsAPI
---------------------------------------------------------- */
-const QUERY_TERMS = [
-  "tornado", "flash flood", "flood", "wildfire", "hurricane",
-  "tropical storm", "winter storm", "blizzard",
-  "earthquake", "power outage", "severe weather",
-  "heat wave", "extreme heat", "landslide", "mudslide",
-];
-
-function buildOrQuery(terms) {
-  return terms
-    .map((t) => (t.includes(" ") ? `"${t}"` : t))
-    .join(" OR ");
-}
-
-/* ---------------------------------------------------------
-   Noise blockers
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Noise blockers — very lightweight, because OPTION A
+// wants maximum throughput
+// ----------------------------------------------------
 const HARD_BLOCK =
-  /\b(taylor swift|grammy|oscars?|concert|celebrity|museum|painting|album|movie|music video)\b/i;
+  /\b(taylor swift|concert|movie|album|celebrity|fashion|netflix|trailer|box office)\b/i;
 
 const FIGURATIVE =
-  /\b(fans?\s+flood|sales?\s+flood|media\s+storm|political\s+storm|stormed\s+the)\b/i;
+  /\b(fans? flood|flood of|media storm|political storm|stormed the)\b/i;
 
-const CONTEXT_VALIDATORS =
-  /\b(national weather service|nws|evac|rain|snow|ice|hail|wind|mph|gust|storm surge|landfall|burn|firefighters?)\b/i;
+// ----------------------------------------------------
+// Context validators (loose for OPTION A)
+// ----------------------------------------------------
+const CONTEXT_RE =
+  /\b(national weather service|nws|evac|damage|destroyed|collapsed|injured|killed|winds?|mph|gust|rain|snow|hail|firefighters?|burned|evacuations?)\b/i;
 
-/* ---------------------------------------------------------
-   Deterministic jitter (avoid stacking)
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Deterministic jitter
+// ----------------------------------------------------
 function hash32(str) {
-  const s = String(str ?? "");
   let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
     h = Math.imul(h, 0x01000193);
   }
   return h >>> 0;
 }
 
 function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function rand() {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  return function() {
+    let t = (seed += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), 1 | t);
     t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-function jitter([lon, lat], seed, deg = 0.18) {
+function jitter([lon, lat], seed, deg = 0.22) {
   const r = mulberry32(hash32(seed));
-  return [lon + (r() - 0.5) * deg, lat + (r() - 0.5) * deg];
+  return [
+    lon + (r() - 0.5) * deg,
+    lat + (r() - 0.5) * deg,
+  ];
 }
 
-/* ---------------------------------------------------------
-   Extraction helpers
---------------------------------------------------------- */
-function tryRegionalFallback(text) {
-  text = text.toLowerCase();
-  for (const region of Object.keys(REGIONAL_CENTROIDS)) {
-    if (text.includes(region)) {
-      return {
-        point: jitter(REGIONAL_CENTROIDS[region], `region|${region}`, 0.35),
-        method: `us-region-${region.replace(/\s+/g, "-")}`,
-        confidence: 1,
-      };
-    }
-  }
-  return null;
-}
-
-function fallbackStateOnly(text) {
-  text = text.toLowerCase();
-  for (const name of STATE_NAMES) {
-    if (text.includes(name)) {
-      const abbr = STATE_NAME_TO_CODE[name];
-      const center = STATE_CENTROIDS[abbr];
-      if (!center) continue;
-      return {
-        point: jitter(center, `state|${abbr}`, 0.28),
-        method: "state-name",
-        confidence: 1,
-      };
-    }
-  }
-  return null;
-}
-
-/* ---------------------------------------------------------
-   County match (best) — similar to your old version
---------------------------------------------------------- */
+// ----------------------------------------------------
+// County matching
+// ----------------------------------------------------
 function normalizeCountyName(raw) {
   if (!raw) return "";
-  let s = String(raw).trim();
+  let s = raw.trim().toLowerCase();
   s = s.replace(/^city of\s+/i, "");
-  s = s.replace(
-    /\s+(county|parish|borough|census area|municipio|municipality|city)$/i,
-    ""
-  );
+  s = s.replace(/\s+(county|parish)\b/i, "");
   s = s.replace(/^st[.\s]+/i, "saint ");
-  return s.replace(/\./g, "").replace(/\s+/g, " ").trim();
+  return s.replace(/\./g, "").trim();
 }
 
 function getCountyCenter(stateAbbr, countyRaw) {
-  const stateMap = countyCenters?.[stateAbbr];
+  const stateMap = countyCenters[stateAbbr];
   if (!stateMap) return null;
+
   const norm = normalizeCountyName(countyRaw);
-  if (!norm) return null;
-  if (stateMap[norm]) return stateMap[norm];
-
   const lower = norm.toLowerCase();
-  for (const k of Object.keys(stateMap)) {
-    if (String(k).toLowerCase() === lower) return stateMap[k];
-  }
 
+  for (const k of Object.keys(stateMap)) {
+    if (k.toLowerCase() === lower) return stateMap[k];
+  }
   return null;
 }
 
-function tryCountyState(text) {
-  const matches = [];
+function tryCounty(text) {
   const re =
-    /\b([a-z0-9 .'\-]+?)\s+(county|parish)\b[, ]+\s*(AL|AK|AZ|AR|CA|CO|CT|DC|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WV|WI|WY)\b/gi;
+    /\b([a-z0-9 .'\-]+?)\s+(county|parish)\b[, ]*\s*(AL|AK|AZ|AR|CA|CO|CT|DC|DE|FL|GA|HI|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WV|WI|WY)\b/gi;
 
+  const points = [];
   let m;
   while ((m = re.exec(text))) {
     const county = m[1];
     const st = m[3].toUpperCase();
-    const p = getCountyCenter(st, county);
-    if (p) matches.push(p);
+    const pt = getCountyCenter(st, county);
+    if (pt) points.push(pt);
   }
+  if (!points.length) return null;
 
-  if (!matches.length) return null;
-
-  const lon = matches.reduce((s, p) => s + p[0], 0) / matches.length;
-  const lat = matches.reduce((s, p) => s + p[1], 0) / matches.length;
+  const lon = points.reduce((s,p)=>s+p[0],0)/points.length;
+  const lat = points.reduce((s,p)=>s+p[1],0)/points.length;
 
   return {
-    point: jitter([lon, lat], `county|${matches.length}`, 0.12),
-    method: matches.length > 1 ? "county-centroid" : "county-center",
-    confidence: matches.length > 1 ? 3 : 4,
+    coordinates: [lon, lat],
+    method: "county-centroid",
   };
 }
 
-/* ---------------------------------------------------------
-   Extract location (Option B pipeline)
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Region fallback
+// ----------------------------------------------------
+function tryRegion(text) {
+  const lower = text.toLowerCase();
+  for (const region of Object.keys(REGIONAL_CENTROIDS)) {
+    if (lower.includes(region)) {
+      return {
+        coordinates: REGIONAL_CENTROIDS[region],
+        method: `us-region-${region.replace(/\s+/g,"-")}`,
+      };
+    }
+  }
+  return null;
+}
+
+// ----------------------------------------------------
+// State fallback
+// ----------------------------------------------------
+function tryState(text) {
+  const lower = text.toLowerCase();
+  for (const [name, abbr] of Object.entries(STATE_NAME_TO_CODE)) {
+    if (lower.includes(name)) {
+      const center = STATE_CENTROIDS[abbr];
+      if (center) return {
+        coordinates: center,
+        method: "state-centroid",
+      };
+    }
+  }
+  return null;
+}
+
+// ----------------------------------------------------
+// Location extraction pipeline (OPTION A)
+// ----------------------------------------------------
 function extractLocation(textRaw, seedStr) {
   if (!textRaw) return null;
   const text = textRaw.toLowerCase();
 
-  if (HARD_BLOCK.test(text) || FIGURATIVE.test(text)) return null;
+  if (HARD_BLOCK.test(text)) return null;     // obvious junk
+  if (FIGURATIVE.test(text)) return null;     // metaphorical events
 
-  const hazard = [...text.matchAll(HAZARD_RE)];
-  if (!hazard.length) return null;
+  // Hazard detection
+  const hMatch = text.match(HAZARD_RE);
+  if (!hMatch) return null;
 
-  // Confirm context
-  let confirmed = false;
-  for (const h of hazard) {
-    const i = h.index || 0;
-    const win = text.slice(Math.max(0, i - 500), i + 500);
-    if (CONTEXT_VALIDATORS.test(win)) {
-      confirmed = true;
-      break;
-    }
+  // Soft context validation
+  if (!CONTEXT_RE.test(text)) {
+    // still accept for OPTION A (looser rules)
+    // but deprioritize to region/state fallback
   }
-  if (!confirmed) return null;
 
-  // Best → county
-  const county = tryCountyState(text);
-  if (county) return {
-    geometry: { type: "Point", coordinates: county.point },
-    geometryMethod: county.method,
-    place: { state: county.state ?? null, confidence: county.confidence },
-  };
+  // 1) County precision
+  const county = tryCounty(text);
+  if (county) {
+    return {
+      geometry: {
+        type: "Point",
+        coordinates: jitter(county.coordinates, seedStr, 0.18),
+      },
+      method: county.method,
+    };
+  }
 
-  // City, ST → state centroid (your earlier logic)
+  // 2) City, ST pattern → state centroid
   const cityRe =
     /\b([A-Za-z.\- ']+?),\s*(AL|AK|AZ|AR|CA|CO|CT|DC|DE|FL|GA|HI|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WV|WI|WY)\b/gi;
 
-  let cm;
-  while ((cm = cityRe.exec(text))) {
-    const st = cm[2].toUpperCase();
-    const stateCenter = STATE_CENTROIDS[st];
-    if (stateCenter) {
+  let m;
+  while ((m = cityRe.exec(text))) {
+    const st = m[2].toUpperCase();
+    const center = STATE_CENTROIDS[st];
+    if (center) {
       return {
-        geometry: { type: "Point", coordinates: jitter(stateCenter, seedStr, 0.18) },
-        geometryMethod: "city-state→state-centroid",
-        place: { state: st, confidence: 2 },
+        geometry: {
+          type: "Point",
+          coordinates: jitter(center, seedStr, 0.20),
+        },
+        method: "city-state-centroid",
       };
     }
   }
 
-  // Region fallback (new in Option B)
-  const region = tryRegionalFallback(text);
-  if (region) return {
-    geometry: { type: "Point", coordinates: region.point },
-    geometryMethod: region.method,
-    place: { state: null, confidence: region.confidence },
-  };
+  // 3) Regional fallback
+  const region = tryRegion(text);
+  if (region) {
+    return {
+      geometry: {
+        type: "Point",
+        coordinates: jitter(region.coordinates, seedStr, 0.28),
+      },
+      method: region.method,
+    };
+  }
 
-  // State fallback
-  const stOnly = fallbackStateOnly(text);
-  if (stOnly) return {
-    geometry: { type: "Point", coordinates: stOnly.point },
-    geometryMethod: stOnly.method,
-    place: { state: null, confidence: stOnly.confidence },
-  };
+  // 4) State fallback
+  const st = tryState(text);
+  if (st) {
+    return {
+      geometry: {
+        type: "Point",
+        coordinates: jitter(st.coordinates, seedStr, 0.30),
+      },
+      method: st.method,
+    };
+  }
 
   return null;
 }
 
-/* ---------------------------------------------------------
-   Normalize article → DB doc
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Normalize NewsAPI → DB doc
+// ----------------------------------------------------
 function normalizeArticle(article) {
   try {
-    const title = String(article?.title || "").trim();
-    if (!title) return null;
+    const title = (article.title || "").trim();
+    const desc = (article.description || "").trim();
+    const url = (article.url || "").trim();
+    if (!url || !title) return null;
 
-    const desc = String(article?.description || "").trim();
-    const fullText = `${title}\n${desc}`.toLowerCase();
-
-    const url = String(article?.url || "").trim();
-    if (!url) return null;
+    const text = `${title}\n${desc}`.toLowerCase();
     const seedStr = `newsapi|${url}`;
 
-    const publishedAt = new Date(article?.publishedAt || Date.now());
-
-    let domain = "";
-    try {
-      domain = new URL(url).hostname.replace(/^www\./, "");
-    } catch {}
-
-    const loc = extractLocation(fullText, seedStr);
+    const loc = extractLocation(text, seedStr);
     if (!loc) return null;
 
     return {
@@ -346,28 +340,30 @@ function normalizeArticle(article) {
       title,
       description: desc,
       url,
-      domain,
-      source: article?.source?.name || domain || "Unknown",
+      domain: (() => {
+        try { return new URL(url).hostname.replace(/^www\./, ""); }
+        catch { return ""; }
+      })(),
+      source: article.source?.name || "Unknown",
 
-      publishedAt,
+      publishedAt: new Date(article.publishedAt || Date.now()),
       createdAt: new Date(),
       expires: new Date(Date.now() + 72 * 3600 * 1000),
 
       geometry: loc.geometry,
-      geometryMethod: loc.geometryMethod,
-      place: loc.place,
+      geometryMethod: loc.method,
     };
-  } catch {
+  } catch (err) {
+    console.warn("⚠️ normalizeArticle failed:", err.message);
     return null;
   }
 }
 
-/* ---------------------------------------------------------
-   Save
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Save to MongoDB
+// ----------------------------------------------------
 async function saveNewsArticles(articles) {
-  const db = getDB();
-  const col = db.collection("social_signals");
+  const col = getDB().collection("social_signals");
 
   let saved = 0;
   for (const a of articles) {
@@ -377,41 +373,44 @@ async function saveNewsArticles(articles) {
   console.log(`💾 Saved ${saved} NewsAPI articles`);
 }
 
-/* ---------------------------------------------------------
-   Poller
---------------------------------------------------------- */
+// ----------------------------------------------------
+// Poller
+// ----------------------------------------------------
 export async function pollNewsAPI() {
   console.log("📰 NewsAPI poll running…");
 
   if (!NEWS_API_KEY) {
-    console.warn("⚠️ Missing NEWS_API_KEY");
+    console.warn("⚠️ Missing NEWS_API_KEY — skipping.");
     return;
   }
 
   try {
-    const q = buildOrQuery(QUERY_TERMS);
+    const q = HAZARD_WORDS.map(w =>
+      w.includes(" ") ? `"${w}"` : w
+    ).join(" OR ");
+
     const from = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
 
     const url =
       `${NEWS_API_URL}?q=${encodeURIComponent(q)}` +
       `&language=en&from=${encodeURIComponent(from)}` +
-      `&sortBy=publishedAt&pageSize=50&apiKey=${NEWS_API_KEY}`;
+      `&sortBy=publishedAt&pageSize=100&apiKey=${NEWS_API_KEY}`;
 
     console.log("🔍 NewsAPI URL:", url.replace(NEWS_API_KEY, "REDACTED"));
 
     const { data } = await axios.get(url, { timeout: 20000 });
+    const raw = data?.articles || [];
 
-    if (!data?.articles?.length) {
+    if (!raw.length) {
       console.log("⚠️ NewsAPI returned zero articles.");
       return;
     }
 
-    const normalized = data.articles.map(normalizeArticle).filter(Boolean);
-
-    console.log(`✅ Normalized ${normalized.length} of ${data.articles.length}`);
+    const normalized = raw.map(normalizeArticle).filter(Boolean);
+    console.log(`✅ Normalized ${normalized.length} / ${raw.length}`);
 
     if (normalized.length) await saveNewsArticles(normalized);
   } catch (err) {
-    console.error("❌ NewsAPI error:", err.response?.data || err.message);
+    console.error("❌ NewsAPI error:", err.message);
   }
 }
