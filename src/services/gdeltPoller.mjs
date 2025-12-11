@@ -486,14 +486,9 @@ export async function pollGDELT() {
         avgTone,
       });
 
-      // Fallback: if still nothing, but strong negative sentiment -> potential event
+      // 🚨 NEVER DROP A GEO-LOCATED ARTICLE
       if (!hazardLabel) {
-        const stronglyNeg = goldstein <= -3 || avgTone <= -2;
-        if (stronglyNeg && (place || actor1 || actor2)) {
-          hazardLabel = GENERIC_POTENTIAL_LABEL;
-        } else {
-          continue; // not interesting enough
-        }
+        hazardLabel = "News Event";
       }
 
       hazards++;
