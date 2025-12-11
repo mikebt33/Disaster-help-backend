@@ -1449,28 +1449,20 @@ function normalizeMeteoItem(item, isAtom = false) {
     const publishedRaw = item?.pubDate || item?.published || item?.updated;
     const sent = parseDateMaybe(publishedRaw || Date.now());
 
-    // ---- 1) Extract hazard + severity from HTML metadata ----
-    const AWARENESS_TYPE_RE = /data-awareness-type="(\d+)"/gi;
-    const AWARENESS_LEVEL_RE = /data-awareness-level="(\d+)"/gi;
+    // ---- Extract hazard metadata ----
+    const TYPE_RE = /data-awareness-type="(\d+)"/gi;
+    const LEVEL_RE = /data-awareness-level="(\d+)"/gi;
 
-    const hazardTypes = [];
-    const severities = [];
+    const types = [];
+    const levels = [];
 
     let m;
+    while ((m = TYPE_RE.exec(rawDescription))) types.push(Number(m[1]));
+    while ((m = LEVEL_RE.exec(rawDescription))) levels.push(Number(m[1]));
 
-    while ((m = AWARENESS_TYPE_RE.exec(rawDescription))) {
-      hazardTypes.push(Number(m[1]));
-    }
+    const hazardCode = types[0] ?? null;
+    const severityCode = levels.length ? Math.max(...levels) : null;
 
-    while ((m = AWARENESS_LEVEL_RE.exec(rawDescription))) {
-      severities.push(Number(m[1]));
-    }
-
-    // pick highest severity
-    const severityCode = severities.length ? Math.max(...severities) : null;
-    const hazardCode = hazardTypes.length ? hazardTypes[0] : null;
-
-    // Map hazard types
     const HAZARD_MAP = {
       12: "Windstorm",
       11: "Thunderstorm",
@@ -1483,12 +1475,11 @@ function normalizeMeteoItem(item, isAtom = false) {
       4: "Coastal Event",
       3: "Forest Fire",
       2: "Snowfall",
-      1: "General Weather Warning",
+      1: "Weather Warning",
     };
 
     const hazardLabel = HAZARD_MAP[hazardCode] || "Weather Warning";
 
-    // Map severity level
     let severity = "Unknown";
     if (severityCode === 4) severity = "Extreme";
     else if (severityCode === 3) severity = "Severe";
@@ -1497,35 +1488,65 @@ function normalizeMeteoItem(item, isAtom = false) {
 
     if (SKIP_MINOR_ALERTS && severity === "Minor") return null;
 
-    // ---- 2) Extract time periods ----
-    const TIME_RE = /From:\s*<\/b><i>([^<]+)<\/i><b>.*?Until:\s*<\/b><i>([^<]+)<\/i>/g;
+    // ---- Extract time periods ----
+    const PERIOD_RE = /From:\s*<\/b><i>([^<]+)<\/i><b>.*?Until:\s*<\/b><i>([^<]+)<\/i>/g;
 
     const periods = [];
-    while ((m = TIME_RE.exec(rawDescription))) {
+    while ((m = PERIOD_RE.exec(rawDescription))) {
       periods.push({
         from: parseDateMaybe(m[1]),
         until: parseDateMaybe(m[2]),
       });
     }
 
-    // Build readable description
-    let cleanDescription = "";
+    // Deduplicate identical periods
+    const uniquePeriods = Array.from(
+      new Map(periods.map(p => [`${p.from}-${p.until}`, p])).values()
+    );
 
-    if (periods.length) {
-      cleanDescription += "Time Periods:\n";
-      for (const p of periods) {
-        cleanDescription += `• From ${p.from.toISOString()} to ${p.until.toISOString()}\n`;
+    // Friendly time formatting
+    function fmt(d) {
+      if (!(d instanceof Date)) return "";
+      return d.toUTCString().replace(" GMT", "");
+    }
+
+    // Build readable "Time Periods" section
+    let timeText = "";
+    if (uniquePeriods.length) {
+      timeText = "Affected Periods:\n";
+      for (const p of uniquePeriods) {
+        timeText += `• ${fmt(p.from)} → ${fmt(p.until)}\n`;
       }
     }
 
-    const stripped = rawDescription
-      .replace(/<[^>]*>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    // ---- Build natural-language summary ----
+    const SUMMARY_MAP = {
+      "Windstorm": "Strong winds expected.",
+      "Thunderstorm": "Thunderstorms likely, potentially severe.",
+      "Fog": "Low visibility expected due to fog.",
+      "Extreme Cold": "Dangerously cold temperatures expected.",
+      "Extreme Heat": "Extremely hot conditions expected.",
+      "Heavy Rain": "Heavy rainfall expected; flooding possible.",
+      "Snow / Ice": "Snow or ice expected; hazardous travel conditions.",
+      "Avalanche": "Avalanche risk in mountainous areas.",
+      "Coastal Event": "Hazardous coastal conditions expected (waves, surge, wind).",
+      "Forest Fire": "Wildfire conditions present or expected.",
+      "Snowfall": "Snowfall expected; accumulation possible.",
+      "Weather Warning": "Hazardous weather conditions expected.",
+    };
 
-    cleanDescription += `\nDetails: ${stripped}`.trim();
+    const summary = `${severity} ${hazardLabel}: ${SUMMARY_MAP[hazardLabel]}`;
 
-    // ---- 3) Geometry handling ----
+    // Remove HTML entirely for the auxiliary details
+    const cleanRaw = rawDescription.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+
+    const description =
+      (uniquePeriods.length ? timeText + "\n" : "") +
+      summary +
+      "\n\nFurther details: " +
+      cleanRaw;
+
+    // ---- Geometry ----
     let geometry = null;
     let geometryMethod = null;
 
@@ -1563,25 +1584,13 @@ function normalizeMeteoItem(item, isAtom = false) {
 
     if (!geometry) return null;
 
-    // ---- 4) Final alert fields ----
     const idSeed = link || title || `${sent.toISOString()}|${hash32(title)}`;
     const identifier = `METEOALARM-${hash32(idSeed)}`;
 
     const expires =
-      periods.length > 0
-        ? periods[periods.length - 1].until
-        : new Date(sent.getTime() + 24 * 60 * 60 * 1000);
-
-    const infoBlock = {
-      category: "Met",
-      event: hazardLabel,
-      urgency: "Unknown",
-      severity,
-      certainty: "Observed",
-      headline: `${severity} ${hazardLabel}`,
-      description: cleanDescription,
-      instruction: "",
-    };
+      uniquePeriods.length > 0
+        ? uniquePeriods[uniquePeriods.length - 1].until
+        : new Date(sent.getTime() + 24 * 3600 * 1000);
 
     return {
       identifier,
@@ -1590,30 +1599,31 @@ function normalizeMeteoItem(item, isAtom = false) {
       status: "Actual",
       msgType: "Alert",
       scope: "Public",
-      info: infoBlock,
-
-      area: {
-        areaDesc: title,
-        polygon: null,
+      info: {
+        category: "Met",
+        event: hazardLabel,
+        urgency: "Expected",
+        severity,
+        certainty: "Likely",
+        headline: `${severity} ${hazardLabel}`,
+        description,
+        instruction: "",
       },
-
+      area: { areaDesc: title, polygon: null },
       geometry,
       geometryMethod,
       bbox: null,
       hasGeometry: true,
-
       title: `${severity} ${hazardLabel}`,
-      summary: cleanDescription.slice(0, 500),
-
+      summary: summary,
       source: "Meteoalarm",
       timestamp: new Date(),
       expires,
-
       meteoalarm: {
         link,
         hazardCode,
         severityCode,
-        periods,
+        periods: uniquePeriods,
       },
     };
   } catch (err) {
