@@ -1,14 +1,15 @@
 // src/services/gdeltPoller.mjs
-// GDELT Poller — Worldwide, hazard-max, TLS-safe, event-code boosted.
+// GDELT Poller — Worldwide, maximum signals, TLS-safe.
 // -------------------------------------------------------------------
 // - Worldwide ingest (no US-only restriction)
 // - TLS-safe URL rewriting -> storage.googleapis.com
 // - Event-root-code + event-code hazard boosting
 // - Expanded hazard keyword detection (URL slugs, outages, windstorm, etc.)
 // - Damage/impact fallback classification
-// - Loosened domain blocking (celebrity-only)
+// - Loosened domain blocking (celebrity / entertainment only)
 // - BulkWrite batching + TTL expiration
 // - Micro-jitter to reduce stacking without breaking map clustering
+// - Always tries hard to assign a hazard label so the map stays busy
 
 import axios from "axios";
 import unzipper from "unzipper";
@@ -28,12 +29,10 @@ const USER_AGENT =
 
 // rewrite ZIP URLs from data.gdeltproject.org → storage.googleapis.com
 function rewriteGdeltUrl(url) {
-  // handle both http/https and ensure gdeltv2 path is preserved
-  return url
-    .replace(
-      /^https?:\/\/data\.gdeltproject\.org\//i,
-      "https://storage.googleapis.com/data.gdeltproject.org/"
-    );
+  return url.replace(
+    /^https?:\/\/data\.gdeltproject\.org\//i,
+    "https://storage.googleapis.com/data.gdeltproject.org/"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +86,7 @@ const MIN_COLUMNS = 61;
 // ---------------------------------------------------------------------------
 
 const BLOCKED_DOMAIN_SUBSTRINGS = [
+  // celebrity / entertainment / gossip
   "tmz.com",
   "people.com",
   "perezhilton",
@@ -99,7 +99,7 @@ const BLOCKED_DOMAIN_SUBSTRINGS = [
 const TTL_HOURS = Number(process.env.GDELT_TTL_HOURS) || 24;
 const TTL_MS = TTL_HOURS * 3600 * 1000;
 
-const MAX_SAVE = Number(process.env.GDELT_MAX_SAVE) || 400;
+const MAX_SAVE = Number(process.env.GDELT_MAX_SAVE) || 600; // keep the map lively
 const BATCH_SIZE = Number(process.env.GDELT_BATCH_SIZE) || 250;
 
 // helper: extract domain from URL
@@ -122,10 +122,11 @@ function isBlocked(domain) {
 // Hazard boosting — roots + event codes + text patterns
 // ---------------------------------------------------------------------------
 
+// Expand root codes a bit for maximum signal (GDELT CAMEO roots)
 const HAZARD_ROOTCODES = new Set([
-  "07",
+  "07", // protest / violent, often used around disaster protests/riots
   "08",
-  "10",
+  "10", // natural disasters, infrastructure
   "11",
   "14",
   "15",
@@ -135,6 +136,7 @@ const HAZARD_ROOTCODES = new Set([
 ]);
 
 const HAZARD_EVENTCODES = new Set([
+  // emergency / disaster-related events
   "102",
   "103",
   "190",
@@ -146,26 +148,67 @@ const HAZARD_EVENTCODES = new Set([
 
 const HAZARD_PATTERNS = [
   { label: "Tornado", re: /\b(tornado|twister|waterspout)\b/i },
-  { label: "Hurricane / Tropical", re: /\b(hurricane|tropical storm|cyclone|typhoon)\b/i },
-  { label: "High wind", re: /\b(high winds?|strong winds?|damaging winds?|windstorm|gusty)\b/i },
-  { label: "Severe storm", re: /\b(thunderstorm|severe storm|hail|microburst|downburst)\b/i },
-  { label: "Winter storm", re: /\b(blizzard|winter storm|snowstorm|whiteout|ice storm)\b/i },
-  { label: "Flood", re: /\b(flooding|flash flood|inundat|storm surge)\b/i },
-  { label: "Wildfire", re: /\b(wild ?fire|forest fire|brush fire|grass fire)\b/i },
-  { label: "Earthquake", re: /\b(earthquake|aftershock|seismic)\b/i },
+  {
+    label: "Hurricane / Tropical",
+    re: /\b(hurricane|tropical storm|cyclone|typhoon)\b/i,
+  },
+  {
+    label: "High Wind",
+    re: /\b(high winds?|strong winds?|damaging winds?|windstorm|gusty)\b/i,
+  },
+  {
+    label: "Severe Storm",
+    re: /\b(thunderstorm|severe storm|hail|microburst|downburst)\b/i,
+  },
+  {
+    label: "Winter Storm",
+    re: /\b(blizzard|winter storm|snowstorm|whiteout|ice storm)\b/i,
+  },
+  {
+    label: "Flood",
+    re: /\b(flood(ing)?|flash flood|inundat|storm surge|dam burst|levee)\b/i,
+  },
+  {
+    label: "Wildfire",
+    re: /\b(wild ?fire|forest fire|brush fire|grass fire|bushfire)\b/i,
+  },
+  {
+    label: "Earthquake",
+    re: /\b(earthquake|aftershock|seismic|richter)\b/i,
+  },
   { label: "Tsunami", re: /\b(tsunami)\b/i },
   { label: "Volcano", re: /\b(volcano|lava|eruption|ash plume)\b/i },
-  { label: "Landslide", re: /\b(landslide|mudslide|debris flow|rockslide)\b/i },
-  { label: "Extreme heat", re: /\b(heat wave|excessive heat|dangerous heat)\b/i },
-  { label: "Drought", re: /\b(drought|water shortage)\b/i },
-  { label: "Power outage", re: /\b(power outage|blackout|downed lines?)\b/i },
-  { label: "Explosion / Hazmat", re: /\b(explosion|hazmat|chemical spill|toxic leak)\b/i },
+  {
+    label: "Landslide",
+    re: /\b(landslide|mudslide|debris flow|rockslide|slope failure)\b/i,
+  },
+  {
+    label: "Extreme Heat",
+    re: /\b(heat wave|heatwave|excessive heat|dangerous heat)\b/i,
+  },
+  { label: "Drought", re: /\b(drought|water shortage|dry spell)\b/i },
+  {
+    label: "Power Outage",
+    re: /\b(power outage|blackout|power cut|grid failure|downed lines?)\b/i,
+  },
+  {
+    label: "Explosion / Hazmat",
+    re: /\b(explosion|blast|hazmat|chemical spill|toxic leak|gas leak)\b/i,
+  },
+  {
+    label: "Storm / Weather",
+    re: /\b(severe weather|storm damage|gale force|monsoon|typhoon)\b/i,
+  },
 ];
 
 const DAMAGE_PATTERN =
-  /\b(collaps(ed|e)|destroyed|damaged|washed (away|out)|swept away|missing|injured|killed|fatalities|dead|displaced|evacuate|rescued|stranded|trapped)\b/i;
+  /\b(collaps(ed|e)|destroyed|damaged|washed (away|out)|swept away|missing|injured|killed|fatalit(ies|y)|dead|displaced|evacuate(d|s|ing)?|rescued|stranded|trapped)\b/i;
+
+const CONTEXT_WEATHER_RE =
+  /\b(rain|snow|storm|wind|hail|lightning|flood|earthquake|wildfire|mudslide|landslide|tsunami|volcano|heat wave|drought|monsoon|typhoon|cyclone|hurricane)\b/i;
 
 const GENERIC_IMPACT_LABEL = "Significant Impact Event";
+const GENERIC_POTENTIAL_LABEL = "Potential Impact Event";
 
 function detectHazardFromText(t) {
   if (!t) return null;
@@ -183,20 +226,40 @@ function classifyHazard({
   domain,
   eventCode,
   rootCode,
+  goldstein,
+  avgTone,
 }) {
-  const text = [actor1, actor2, place, url, domain]
+  const combined = [actor1, actor2, place, url, domain]
     .join(" ")
     .replace(/[-_/]+/g, " ")
     .toLowerCase();
 
-  const txt = detectHazardFromText(text);
-  if (txt) return txt;
+  // 1) Direct hazard match from patterns
+  const direct = detectHazardFromText(combined);
+  if (direct) return direct;
 
-  if (DAMAGE_PATTERN.test(text)) return GENERIC_IMPACT_LABEL;
+  // 2) Explicit damage / casualties language
+  if (DAMAGE_PATTERN.test(combined)) return GENERIC_IMPACT_LABEL;
 
-  if (HAZARD_ROOTCODES.has(rootCode)) return "Significant Event";
-  if (HAZARD_EVENTCODES.has(eventCode)) return "Emergency Response";
+  // 3) Root / event codes hinting at disaster/emergency
+  if (HAZARD_ROOTCODES.has(rootCode) || HAZARD_EVENTCODES.has(eventCode)) {
+    // If we see any weather/disaster context, upgrade label
+    if (CONTEXT_WEATHER_RE.test(combined)) {
+      return "Disaster / Emergency Event";
+    }
+    return GENERIC_IMPACT_LABEL;
+  }
 
+  // 4) Fallback: strongly negative Goldstein/AvgTone + disaster-ish context
+  const g = Number(goldstein);
+  const tone = Number(avgTone);
+  const stronglyNegative = g <= -3 || tone <= -2;
+
+  if (stronglyNegative && CONTEXT_WEATHER_RE.test(combined)) {
+    return GENERIC_POTENTIAL_LABEL;
+  }
+
+  // 5) Otherwise, no hazard
   return null;
 }
 
@@ -225,7 +288,7 @@ function pickGeo(cols) {
       country: cols[IDX.ACTIONGEO_COUNTRY],
       adm1: cols[IDX.ACTIONGEO_ADM1],
       adm2: cols[IDX.ACTIONGEO_ADM2],
-      bonus: 0.3,
+      bonus: 0.4,
     },
     {
       method: "actor1",
@@ -235,7 +298,7 @@ function pickGeo(cols) {
       country: cols[IDX.ACTOR1GEO_COUNTRY],
       adm1: cols[IDX.ACTOR1GEO_ADM1],
       adm2: cols[IDX.ACTOR1GEO_ADM2],
-      bonus: 0.15,
+      bonus: 0.2,
     },
     {
       method: "actor2",
@@ -245,7 +308,7 @@ function pickGeo(cols) {
       country: cols[IDX.ACTOR2GEO_COUNTRY],
       adm1: cols[IDX.ACTOR2GEO_ADM1],
       adm2: cols[IDX.ACTOR2GEO_ADM2],
-      bonus: 0.05,
+      bonus: 0.1,
     },
   ];
 
@@ -280,6 +343,27 @@ function microJitter(lon, lat, seed, mag = 0.12) {
   const jLon = lon + (rand() - 0.5) * mag;
   const jLat = lat + (rand() - 0.5) * mag;
   return validLonLat(jLon, jLat) ? [jLon, jLat] : [lon, lat];
+}
+
+// ---------------------------------------------------------------------------
+// Title / summary helpers
+// ---------------------------------------------------------------------------
+
+function nicePlaceName(raw) {
+  if (!raw) return "Unknown location";
+  // Take first part before comma to keep it short
+  const s = String(raw).split(",")[0].trim();
+  return s || "Unknown location";
+}
+
+function buildTitle(hazardLabel, place) {
+  const loc = nicePlaceName(place);
+  return `${hazardLabel} near ${loc}`;
+}
+
+function buildDescription(hazardLabel, place) {
+  const loc = nicePlaceName(place);
+  return `${hazardLabel} reported near ${loc}.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,12 +467,14 @@ export async function pollGDELT() {
 
       const eventCode = String(cols[IDX.EVENTCODE] || "").trim();
       const rootCode = String(cols[IDX.EVENTROOTCODE] || "").trim();
+      const goldstein = Number(cols[IDX.GOLDSTEIN]);
+      const avgTone = Number(cols[IDX.AVGTONE]);
 
       const actor1 = cols[IDX.ACTOR1NAME] || "";
       const actor2 = cols[IDX.ACTOR2NAME] || "";
       const place = geo.fullName || "";
 
-      const hazardLabel = classifyHazard({
+      let hazardLabel = classifyHazard({
         actor1,
         actor2,
         place,
@@ -396,9 +482,20 @@ export async function pollGDELT() {
         domain,
         eventCode,
         rootCode,
+        goldstein,
+        avgTone,
       });
 
-      if (!hazardLabel) continue;
+      // Fallback: if still nothing, but strong negative sentiment -> potential event
+      if (!hazardLabel) {
+        const stronglyNeg = goldstein <= -3 || avgTone <= -2;
+        if (stronglyNeg && (place || actor1 || actor2)) {
+          hazardLabel = GENERIC_POTENTIAL_LABEL;
+        } else {
+          continue; // not interesting enough
+        }
+      }
+
       hazards++;
 
       // Timestamp
@@ -425,6 +522,9 @@ export async function pollGDELT() {
         0.12
       );
 
+      const title = buildTitle(hazardLabel, place);
+      const description = buildDescription(hazardLabel, place);
+
       const doc = {
         type: "news",
         source: "GDELT",
@@ -432,10 +532,8 @@ export async function pollGDELT() {
         domain,
         url,
 
-        title: `${hazardLabel} near ${place || "Unknown location"}`,
-        description: `${hazardLabel} reported near ${
-          place || "Unknown location"
-        }.`,
+        title,
+        description,
 
         publishedAt,
         updatedAt: now,
@@ -452,8 +550,8 @@ export async function pollGDELT() {
           dateAdded,
           eventCode,
           rootCode,
-          goldstein: Number(cols[IDX.GOLDSTEIN]),
-          avgTone: Number(cols[IDX.AVGTONE]),
+          goldstein,
+          avgTone,
           actor1,
           actor2,
           place,
