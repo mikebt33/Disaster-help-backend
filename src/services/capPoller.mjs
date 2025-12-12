@@ -1143,7 +1143,13 @@ function normalizeGdacsFeature(feature) {
     if (!geometry) return null;
 
     const sent = parseDateMaybe(
-      props.fromdate || props.fromDate || props.date || props.published || props.updated
+      props.datemodified ||
+      props.updated ||
+      props.todate ||
+      props.fromdate ||
+      props.fromDate ||
+      props.date ||
+      props.published
     );
 
     // If GDACS provides an end date, use it; else TTL fallback.
@@ -1272,7 +1278,7 @@ async function fetchGdacsAlerts() {
     for (const f of features) {
       const a = normalizeGdacsFeature(f);
       if (!a) continue;
-      if (a.sent && a.sent < cutoff) continue;
+      if (a.sent && a.sent < cutoff && a.expires && a.expires < cutoff) continue;
       out.push(a);
       if (GDACS_MAX_SAVE > 0 && out.length >= GDACS_MAX_SAVE) break;
     }
