@@ -438,12 +438,15 @@ export async function pollGDELT() {
     // -------------------------------------------------------------
     // 4) Parse + classify + save
     // -------------------------------------------------------------
-    const rl = readline.createInterface({ input: csvStream });
-    const db = getDB();
-    const col = db.collection("social_signals");
+   const rl = readline.createInterface({ input: csvStream });
+   const db = getDB();
+
+   console.log("🧪 GDELT using DB:", db.databaseName);
+
+   const col = db.collection("social_signals");
 
     // TTL cleanup for GDELT docs only
-    await col.deleteMany({ source: "GDELT", expires: { $lte: now } });
+    //await col.deleteMany({ source: "GDELT", expires: { $lte: now } });
 
     let bulk = [];
 
@@ -580,6 +583,10 @@ export async function pollGDELT() {
     console.log(
       `🌍 GDELT DONE — scanned=${scanned}, urls=${withUrl}, geo=${withGeo}, hazards=${hazards}, saved=${saved}`
     );
+
+     const finalCount = await col.countDocuments({ source: "GDELT" });
+     console.log("🧪 GDELT docs currently in social_signals:", finalCount);
+
   } catch (err) {
     console.error("❌ GDELT ERROR:", err?.message || err);
   }
