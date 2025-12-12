@@ -156,7 +156,7 @@ const GDACS_ENABLED =
   String(process.env.GDACS_ENABLED ?? "true").toLowerCase() !== "false";
 const GDACS_EVENTS_URL =
   process.env.GDACS_EVENTS_URL ||
-  "https://www.gdacs.org/gdacsapi/api/events/geteventlist/geojson.aspx";
+  "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH";
 const GDACS_EVENTTYPES = String(process.env.GDACS_EVENTTYPES || "EQ,TC,FL,VO")
   .split(/[,\s]+/)
   .map((s) => s.trim().toUpperCase())
@@ -1229,15 +1229,44 @@ async function fetchGdacsAlerts() {
 
   console.log("🌐 Fetching GDACS (global disasters)...");
   try {
+    const now = new Date();
+    const cutoff = new Date(Date.now() - GDACS_LOOKBACK_HOURS * 60 * 60 * 1000);
+
+    const fromdate = cutoff.toISOString().slice(0, 10);
+    const todate = now.toISOString().slice(0, 10);
+
+    const eventlist = GDACS_EVENTTYPES.join(";");
+    const alertlevel = SKIP_MINOR_ALERTS
+      ? "red;orange"
+      : "red;orange;green";
+
     const url =
       `${GDACS_EVENTS_URL}?` +
-      `eventtypes=${encodeURIComponent(GDACS_EVENTTYPES.join(","))}`;
+      `eventlist=${encodeURIComponent(eventlist)}` +
+      `&fromdate=${encodeURIComponent(fromdate)}` +
+      `&todate=${encodeURIComponent(todate)}` +
+      `&alertlevel=${encodeURIComponent(alertlevel)}` +
+      `&pagesize=100&pagenumber=1`;
 
-    const res = await axios.get(url, { timeout: 20000 });
-    const data = res.data || {};
-    const features = Array.isArray(data.features) ? data.features : [];
+    console.log("🔎 GDACS URL:", url);
 
-    const cutoff = new Date(Date.now() - GDACS_LOOKBACK_HOURS * 60 * 60 * 1000);
+    const res = await axios.get(url, {
+      timeout: 20000,
+      headers: {
+        Accept: "application/geo+json, application/json;q=0.9, */*;q=0.8",
+      },
+    });
+
+    let data = res.data;
+    if (typeof data === "string") {
+      try {
+        data = JSON.parse(data);
+      } catch {
+        data = {};
+      }
+    }
+
+    const features = Array.isArray(data?.features) ? data.features : [];
 
     const out = [];
     for (const f of features) {
@@ -1247,6 +1276,26 @@ async function fetchGdacsAlerts() {
       out.push(a);
       if (GDACS_MAX_SAVE > 0 && out.length >= GDACS_MAX_SAVE) break;
     }
+
+    const usable = out.filter((a) => a.hasGeometry).length;
+    console.log(`✅ Parsed ${out.length} alerts from GDACS (${usable} usable geo)`);
+
+    if (out.length) await saveAlerts(out);
+  } catch (err) {
+    const status = err?.response?.status;
+    const body = err?.response?.data;
+
+    console.error("❌ Error fetching GDACS:", status || err.message);
+
+    if (body) {
+      const preview =
+        typeof body === "string"
+          ? body.slice(0, 300)
+          : JSON.stringify(body).slice(0, 300);
+      console.error("❌ GDACS error body (preview):", preview);
+    }
+  }
+}
 
     const usable = out.filter((a) => a.hasGeometry).length;
     console.log(`✅ Parsed ${out.length} alerts from GDACS (${usable} usable geo)`);
