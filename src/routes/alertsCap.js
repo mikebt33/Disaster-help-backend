@@ -14,10 +14,15 @@ router.get("/", async (_req, res) => {
     const alerts = db.collection("alerts_cap");
 
     // ✅ Only fetch alerts that have a geometry field
+    const now = new Date();
+
     const recent = await alerts
-      .find({ geometry: { $ne: null } })
-      .sort({ sent: -1 })
-      .limit(200)
+      .find({
+        geometry: { $ne: null },
+        expires: { $gt: now }, // 👈 keep active alerts
+      })
+      .sort({ expires: 1 }) // soonest-expiring first
+      .limit(500)
       .toArray();
 
     res.json({
