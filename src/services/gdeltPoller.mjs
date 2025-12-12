@@ -1,22 +1,8 @@
-// src/services/gdeltPoller.mjs
-// GDELT Poller — “make it show up” mode (reliable finish + visible writes)
-//
-// Key fixes:
-// - HARD overlap guard with finally() release
-// - Explicit readline + stream cleanup
-// - Runtime cap so it can’t run forever on slow instances
-// - Periodic bulk flush so writes happen quickly (not just at the end)
-// - Geo fallback: ActionGeo -> Actor1Geo -> Actor2Geo
-// - TTL anchored to NOW (prevents immediate TTL deletion if DATEADDED is old)
-
 import axios from "axios";
 import unzipper from "unzipper";
 import readline from "readline";
 import { getDB } from "../db.js";
 
-// -----------------------------
-// CONFIG
-// -----------------------------
 const LASTUPDATE_URL =
   "https://storage.googleapis.com/data.gdeltproject.org/gdeltv2/lastupdate.txt";
 
@@ -26,18 +12,11 @@ const USER_AGENT =
 const TTL_HOURS = Number(process.env.GDELT_TTL_HOURS) || 24;
 const TTL_MS = TTL_HOURS * 3600 * 1000;
 
-// Keep these low-ish while debugging so you SEE docs quickly
-const MAX_SAVE = Number(process.env.GDELT_MAX_SAVE) || 300;
-const BATCH_SIZE = Number(process.env.GDELT_BATCH_SIZE) || 50;
-
-// Force exit so cron doesn’t “stack forever”
-const MAX_RUNTIME_MS = Number(process.env.GDELT_MAX_RUNTIME_MS) || 9 * 60 * 1000;
-
-// Flush even if BATCH_SIZE isn’t reached (so you get visible writes quickly)
-const FLUSH_EVERY_MS = Number(process.env.GDELT_FLUSH_EVERY_MS) || 5000;
-
-// Progress logs
-const PROGRESS_EVERY_LINES = Number(process.env.GDELT_PROGRESS_EVERY_LINES) || 50000;
+const MAX_SAVE = Number(process.env.GDELT_MAX_SAVE) || 500;
+const BATCH_SIZE = Number(process.env.GDELT_BATCH_SIZE) || 200;
+const MAX_RUNTIME_MS =
+  Number(process.env.GDELT_MAX_RUNTIME_MS) || 7 * 60 * 1000;
+const FLUSH_EVERY_MS = Number(process.env.GDELT_FLUSH_EVERY_MS) || 8000;
 
 const BLOCKED_DOMAIN_SUBSTRINGS = [
   "tmz.com",
@@ -49,16 +28,6 @@ const BLOCKED_DOMAIN_SUBSTRINGS = [
   "buzzfeed.com",
 ];
 
-function rewriteGdeltUrl(url) {
-  return url.replace(
-    /^https?:\/\/data\.gdeltproject\.org\//i,
-    "https://storage.googleapis.com/data.gdeltproject.org/"
-  );
-}
-
-// -----------------------------
-// GDELT Schema (61 columns)
-// -----------------------------
 const IDX = Object.freeze({
   GLOBALEVENTID: 0,
   SQLDATE: 1,
@@ -71,7 +40,6 @@ const IDX = Object.freeze({
   GOLDSTEIN: 30,
   AVGTONE: 34,
 
-  ACTOR1GEO_TYPE: 35,
   ACTOR1GEO_FULLNAME: 36,
   ACTOR1GEO_COUNTRY: 37,
   ACTOR1GEO_ADM1: 38,
@@ -79,7 +47,6 @@ const IDX = Object.freeze({
   ACTOR1GEO_LAT: 40,
   ACTOR1GEO_LON: 41,
 
-  ACTOR2GEO_TYPE: 43,
   ACTOR2GEO_FULLNAME: 44,
   ACTOR2GEO_COUNTRY: 45,
   ACTOR2GEO_ADM1: 46,
@@ -87,7 +54,6 @@ const IDX = Object.freeze({
   ACTOR2GEO_LAT: 48,
   ACTOR2GEO_LON: 49,
 
-  ACTIONGEO_TYPE: 51,
   ACTIONGEO_FULLNAME: 52,
   ACTIONGEO_COUNTRY: 53,
   ACTIONGEO_ADM1: 54,
@@ -101,9 +67,67 @@ const IDX = Object.freeze({
 
 const MIN_COLUMNS = 61;
 
-// -----------------------------
-// Helpers
-// -----------------------------
+const HAZARD_PATTERNS = [
+  { label: "Tornado", re: /\b(tornado|twister|waterspout)\b/i },
+  {
+    label: "Hurricane / Tropical",
+    re: /\b(hurricane|tropical storm|cyclone|typhoon)\b/i,
+  },
+  {
+    label: "Severe Storm",
+    re: /\b(thunderstorm|severe storm|hail|microburst|downburst|squall)\b/i,
+  },
+  {
+    label: "High Wind",
+    re: /\b(high winds?|strong winds?|damaging winds?|windstorm|gusty)\b/i,
+  },
+  {
+    label: "Winter Storm",
+    re: /\b(blizzard|winter storm|snowstorm|whiteout|ice storm)\b/i,
+  },
+  {
+    label: "Flood",
+    re: /\b(flood(ing)?|flash flood|inundat|storm surge|levee|dam burst)\b/i,
+  },
+  {
+    label: "Wildfire",
+    re: /\b(wild ?fire|forest fire|brush fire|grass fire|bushfire)\b/i,
+  },
+  { label: "Earthquake", re: /\b(earthquake|aftershock|seismic)\b/i },
+  { label: "Tsunami", re: /\b(tsunami)\b/i },
+  { label: "Volcano", re: /\b(volcano|eruption|lava|ash plume)\b/i },
+  {
+    label: "Landslide",
+    re: /\b(landslide|mudslide|debris flow|rockslide|slope failure)\b/i,
+  },
+  {
+    label: "Extreme Heat",
+    re: /\b(heat wave|heatwave|excessive heat|dangerous heat)\b/i,
+  },
+  { label: "Drought", re: /\b(drought|water shortage|dry spell)\b/i },
+  {
+    label: "Power Outage",
+    re: /\b(power outage|blackout|grid failure|downed lines?)\b/i,
+  },
+  {
+    label: "Explosion / Hazmat",
+    re: /\b(explosion|blast|hazmat|chemical spill|toxic leak|gas leak)\b/i,
+  },
+];
+
+const DAMAGE_RE =
+  /\b(damage(d)?|destroy(ed)?|collapsed|washed (away|out)|missing|injured|killed|fatalit(ies|y)|dead|displaced|evacuat(e|ed|ing)|rescued|stranded|trapped)\b/i;
+
+const DISASTER_CONTEXT_RE =
+  /\b(rain|snow|storm|wind|hail|lightning|flood|earthquake|wildfire|mudslide|landslide|tsunami|volcano|heat wave|drought|monsoon|typhoon|cyclone|hurricane)\b/i;
+
+function rewriteGdeltUrl(url) {
+  return url.replace(
+    /^https?:\/\/data\.gdeltproject\.org\//i,
+    "https://storage.googleapis.com/data.gdeltproject.org/"
+  );
+}
+
 function getDomain(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
@@ -112,7 +136,6 @@ function getDomain(url) {
   }
 }
 
-// IMPORTANT: do NOT auto-block missing/invalid domains (that can zero your feed)
 function isBlocked(domain) {
   if (!domain) return false;
   const d = domain.toLowerCase();
@@ -130,7 +153,6 @@ function validLonLat(lon, lat) {
   );
 }
 
-// Choose best geo among ActionGeo / Actor1Geo / Actor2Geo (highest “quality”)
 function pickGeo(cols) {
   const cands = [
     {
@@ -216,19 +238,18 @@ function parseDateAdded(dateAdded, fallback) {
   return Number.isNaN(d.getTime()) ? fallback : d;
 }
 
-// -----------------------------
-// Overlap guard (CRITICAL)
-// -----------------------------
+function detectHazard(text) {
+  if (!text) return null;
+  for (const { label, re } of HAZARD_PATTERNS) {
+    if (re.test(text)) return label;
+  }
+  return null;
+}
+
 let GDELT_RUNNING = false;
 
-// -----------------------------
-// MAIN
-// -----------------------------
 export async function pollGDELT() {
-  if (GDELT_RUNNING) {
-    console.log("⏭️ GDELT skipped (previous run still in progress)");
-    return;
-  }
+  if (GDELT_RUNNING) return;
   GDELT_RUNNING = true;
 
   const startedAt = Date.now();
@@ -240,12 +261,8 @@ export async function pollGDELT() {
 
   let scanned = 0;
   let queued = 0;
-  let flushed = 0;
-
-  console.log("🌎 GDELT Poller running…");
 
   try {
-    // 1) lastupdate.txt
     const { data: lastTxt } = await axios.get(LASTUPDATE_URL, {
       timeout: 15000,
       responseType: "text",
@@ -256,17 +273,11 @@ export async function pollGDELT() {
       .split(/\r?\n/)
       .find((l) => l.includes(".export.CSV.zip"));
 
-    if (!line) {
-      console.warn("⚠️ No GDELT export ZIP found");
-      return;
-    }
+    if (!line) return;
 
     const originalUrl = line.trim().split(/\s+/).pop();
     const zipUrl = rewriteGdeltUrl(originalUrl);
 
-    console.log("⬇️ GDELT ZIP URL:", zipUrl);
-
-    // 2) Download ZIP stream
     const zipResp = await axios.get(zipUrl, {
       responseType: "stream",
       timeout: 60000,
@@ -274,40 +285,19 @@ export async function pollGDELT() {
     });
 
     zipStream = zipResp.data;
-    zipStream.on("error", (e) =>
-      console.error("❌ GDELT zip stream error:", e?.message || e)
-    );
-
-    // 3) Extract the CSV entry stream
-    // Using ParseOne keeps things simple (single CSV per export zip).
     csvStream = zipStream.pipe(unzipper.ParseOne(/\.csv$/i));
-    csvStream.on("error", (e) =>
-      console.error("❌ GDELT csv stream error:", e?.message || e)
-    );
-
-    console.log("📄 Parsing GDELT Events CSV…");
-
-    // 4) Read lines
     rl = readline.createInterface({ input: csvStream, crlfDelay: Infinity });
 
     const db = getDB();
-    console.log("🧪 GDELT using DB:", db.databaseName);
-
     const col = db.collection("social_signals");
 
     let bulk = [];
     let lastFlushAt = Date.now();
 
-    async function flushBulk(reason) {
+    async function flushBulk() {
       if (!bulk.length) return;
-
-      const ops = bulk.length;
       try {
-        const r = await col.bulkWrite(bulk, { ordered: false });
-        flushed += ops;
-        console.log(
-          `✅ GDELT bulkWrite(${reason}) ops=${ops} upserted=${r.upsertedCount} modified=${r.modifiedCount} matched=${r.matchedCount}`
-        );
+        await col.bulkWrite(bulk, { ordered: false });
       } catch (err) {
         console.error("❌ GDELT bulkWrite error:", err?.message || err);
         if (err?.writeErrors?.length) {
@@ -319,28 +309,11 @@ export async function pollGDELT() {
       }
     }
 
-    // If the stream is stuck, this log helps you see it quickly
-    const stuckTimer = setTimeout(() => {
-      if (scanned === 0) {
-        console.warn("⚠️ GDELT: no lines read after 15s (stream may be stuck)");
-      }
-    }, 15000);
-
     for await (const line of rl) {
-      if (Date.now() > deadline) {
-        console.warn("⏰ GDELT runtime cap reached — stopping this run.");
-        break;
-      }
-
+      if (Date.now() > deadline) break;
       if (!line) continue;
 
       scanned++;
-      if (scanned % PROGRESS_EVERY_LINES === 0) {
-        console.log(
-          `…GDELT progress scanned=${scanned} queued=${queued} flushed=${flushed}`
-        );
-      }
-
       const cols = line.split("\t");
       if (cols.length < MIN_COLUMNS) continue;
 
@@ -353,11 +326,28 @@ export async function pollGDELT() {
       const geo = pickGeo(cols);
       if (!geo) continue;
 
+      const actor1 = cols[IDX.ACTOR1NAME] || "";
+      const actor2 = cols[IDX.ACTOR2NAME] || "";
+      const place = geo.fullName || "";
+
+      const combined = [actor1, actor2, place, url, domain]
+        .join(" ")
+        .replace(/[-_/]+/g, " ")
+        .toLowerCase();
+
+      let hazardLabel = detectHazard(combined);
+
+      if (!hazardLabel) {
+        if (DAMAGE_RE.test(combined) && DISASTER_CONTEXT_RE.test(combined)) {
+          hazardLabel = "Disaster / Emergency";
+        } else {
+          continue;
+        }
+      }
+
       const now = new Date();
       const dateAdded = cols[IDX.DATEADDED];
       const publishedAt = parseDateAdded(dateAdded, now);
-
-      // TTL anchored to NOW so docs can’t vanish immediately
       const expires = new Date(Date.now() + TTL_MS);
 
       const [jLon, jLat] = microJitter(
@@ -367,13 +357,8 @@ export async function pollGDELT() {
         0.12
       );
 
-      const place = geo.fullName || "";
-
-      // “Always show something” label — you can re-add hazard classification later
-      const hazardLabel = "News Event";
-
-      const title = `${hazardLabel} near ${nicePlaceName(place)}`;
-      const description = `${hazardLabel} reported near ${nicePlaceName(place)}.`;
+      const loc = nicePlaceName(place);
+      const summary = `${hazardLabel} near ${loc}`;
 
       const doc = {
         type: "news",
@@ -382,21 +367,17 @@ export async function pollGDELT() {
         hazardLabel,
         domain,
         url,
-        title,
-        description,
-
+        title: summary,
+        summary,
+        description: summary,
         publishedAt,
         updatedAt: now,
         expires,
-
         geometry: { type: "Point", coordinates: [jLon, jLat] },
         lat: jLat,
         lon: jLon,
         geometryMethod: `gdelt-${geo.method}`,
-
-        // Optional top-level place, nice for debugging / UI
         place,
-
         gdelt: {
           globalEventId: cols[IDX.GLOBALEVENTID],
           sqlDate: cols[IDX.SQLDATE],
@@ -405,8 +386,8 @@ export async function pollGDELT() {
           rootCode: String(cols[IDX.EVENTROOTCODE] || "").trim(),
           goldstein: Number(cols[IDX.GOLDSTEIN]),
           avgTone: Number(cols[IDX.AVGTONE]),
-          actor1: cols[IDX.ACTOR1NAME] || "",
-          actor2: cols[IDX.ACTOR2NAME] || "",
+          actor1,
+          actor2,
           country: geo.country || "",
           geoMethod: geo.method,
         },
@@ -415,53 +396,25 @@ export async function pollGDELT() {
       bulk.push({
         updateOne: {
           filter: { url },
-          update: {
-            $set: doc,
-            $setOnInsert: { createdAt: now },
-          },
+          update: { $set: doc, $setOnInsert: { createdAt: now } },
           upsert: true,
         },
       });
 
       queued++;
 
-      // Flush by batch size
-      if (bulk.length >= BATCH_SIZE) {
-        await flushBulk("batch");
-      } else if (Date.now() - lastFlushAt > FLUSH_EVERY_MS) {
-        // Flush by time (so you see writes quickly)
-        await flushBulk("timer");
+      if (bulk.length >= BATCH_SIZE || Date.now() - lastFlushAt > FLUSH_EVERY_MS) {
+        await flushBulk();
       }
 
-      if (queued >= MAX_SAVE) {
-        console.log(`🧯 Reached MAX_SAVE=${MAX_SAVE}, stopping early.`);
-        break;
-      }
+      if (queued >= MAX_SAVE) break;
     }
 
-    clearTimeout(stuckTimer);
-
-    // final flush
-    await flushBulk("final");
-
-    // Ensure readline is closed
-    try {
-      rl?.close();
-    } catch {}
-
-    const finalCount = await col.countDocuments({ source: "GDELT" });
-    console.log(
-      `🌍 GDELT DONE scanned=${scanned} queued=${queued} flushed=${flushed} dbCount(GDELT)=${finalCount} runtimeSec=${Math.round(
-        (Date.now() - startedAt) / 1000
-      )}`
-    );
+    await flushBulk();
   } catch (err) {
     console.error("❌ GDELT ERROR:", err?.message || err);
   } finally {
-    // CRITICAL: release overlap guard
     GDELT_RUNNING = false;
-
-    // CRITICAL: cleanup streams so we don’t hang forever
     try {
       rl?.close();
     } catch {}
@@ -471,7 +424,7 @@ export async function pollGDELT() {
     try {
       zipStream?.destroy();
     } catch {}
-
-    console.log("✅ GDELT finished cleanly");
+    const runtimeSec = Math.round((Date.now() - startedAt) / 1000);
+    console.log(`✅ GDELT done scanned=${scanned} saved=${queued} runtimeSec=${runtimeSec}`);
   }
 }
