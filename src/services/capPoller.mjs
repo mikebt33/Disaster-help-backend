@@ -156,7 +156,7 @@ const GDACS_ENABLED =
   String(process.env.GDACS_ENABLED ?? "true").toLowerCase() !== "false";
 const GDACS_EVENTS_URL =
   process.env.GDACS_EVENTS_URL ||
-  "https://www.gdacs.org/gdacsapi/api/events/geteventlist/geojson";
+  "https://www.gdacs.org/gdacsapi/api/events/geteventlist/geojson.aspx";
 const GDACS_EVENTTYPES = String(process.env.GDACS_EVENTTYPES || "EQ,TC,FL,VO")
   .split(/[,\s]+/)
   .map((s) => s.trim().toUpperCase())
