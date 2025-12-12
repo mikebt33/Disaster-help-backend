@@ -1297,14 +1297,6 @@ async function fetchGdacsAlerts() {
   }
 }
 
-    const usable = out.filter((a) => a.hasGeometry).length;
-    console.log(`✅ Parsed ${out.length} alerts from GDACS (${usable} usable geo)`);
-    if (out.length) await saveAlerts(out);
-  } catch (err) {
-    console.error("❌ Error fetching GDACS:", err.message);
-  }
-}
-
 // Meteoalarm fallback centroids (used only if feed has no GeoRSS geometry)
 const METEO_COUNTRY_CENTROIDS = {
   AL: [20.0, 41.0],
