@@ -385,9 +385,17 @@ export async function pollNewsAPI() {
   }
 
   try {
-    const q = HAZARD_WORDS.map(w =>
-      w.includes(" ") ? `"${w}"` : w
-    ).join(" OR ");
+    const ROTATING_QUERIES = [
+      "flood OR flash flood",
+      "earthquake OR aftershock",
+      "wildfire OR forest fire",
+      "tornado OR severe weather",
+      "hurricane OR tropical storm",
+    ];
+
+    const q = ROTATING_QUERIES[
+      Math.floor(Date.now() / (60 * 60 * 1000)) % ROTATING_QUERIES.length
+    ];
 
     const from = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
 
