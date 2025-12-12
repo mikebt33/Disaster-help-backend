@@ -19,9 +19,13 @@ router.get("/", async (_req, res) => {
     const recent = await alerts
       .find({
         geometry: { $ne: null },
-        expires: { $gt: now }, // 👈 keep active alerts
+        $or: [
+          { expires: { $gt: now } },      // normal case
+          { expires: { $exists: false } },// missing expires
+          { expires: null },              // null expires
+        ],
       })
-      .sort({ expires: 1 }) // soonest-expiring first
+      .sort({ expires: 1, sent: -1 })
       .limit(500)
       .toArray();
 
