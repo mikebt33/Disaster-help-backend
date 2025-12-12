@@ -1152,15 +1152,19 @@ function normalizeGdacsFeature(feature) {
       props.published
     );
 
-    // If GDACS provides an end date, use it; else TTL fallback.
-    const expires = (() => {
-      const end = props.todate || props.toDate || props.enddate || props.endDate || null;
-      if (end) {
-        const d = new Date(end);
-        if (!isNaN(d.getTime())) return d;
-      }
-      return new Date(sent.getTime() + 24 * 60 * 60 * 1000);
-    })();
+    // GDACS events are long-running; use last modification time
+    // and keep them alive for a rolling relevance window.
+    const lastUpdate = parseDateMaybe(
+      props.datemodified ||
+      props.updated ||
+      props.todate ||
+      props.fromdate
+    );
+
+    // Keep GDACS alerts alive for 14 days after last update
+    const expires = new Date(
+      lastUpdate.getTime() + 14 * 24 * 60 * 60 * 1000
+    );
 
     const name =
       props.name ||
