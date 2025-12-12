@@ -113,7 +113,7 @@ function getDomain(url) {
 
 // helper: check if domain should be blocked
 function isBlocked(domain) {
-  if (!domain) return true;
+  if (!domain) return false; // ⬅️ DO NOT BLOCK EMPTY DOMAINS
   const d = domain.toLowerCase();
   return BLOCKED_DOMAIN_SUBSTRINGS.some((b) => d.includes(b));
 }
