@@ -510,7 +510,7 @@ export async function pollGDELT() {
         publishedAt = new Date(`${Y}-${M}-${D}T${h}:${m}:${s}Z`);
       }
 
-      const expires = new Date(publishedAt.getTime() + TTL_MS);
+      const expires = new Date(Date.now() + TTL_MS);
 
       // Micro-jitter
       const [jLon, jLat] = microJitter(
