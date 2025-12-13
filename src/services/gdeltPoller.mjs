@@ -1,3 +1,17 @@
+// src/services/gdeltPoller.mjs
+//
+// GDELT Poller (GDELT 2.1 Events export)
+// - Streams the latest GDELT export ZIP, parses rows, writes to social_signals
+// - TTL is ALWAYS from ingestion (createdAt) -> expires is set ONLY on insert
+// - publishedAt is for UI timestamp (article publish time if we can extract it)
+//   - Fallback: GDELT DATEADDED
+//   - Best: meta/JSON-LD publish timestamps from the article HTML head
+//
+// Output docs in: social_signals
+// { type:"news", provider:"GDELT", source:"News report • ...", title, description,
+//   publishedAt, publishedAtSource, publishedAtPrecision, createdAt, updatedAt,
+//   expires, geometry:{Point}, hazardLabel, url, domain, ... }
+
 import axios from "axios";
 import unzipper from "unzipper";
 import readline from "readline";
@@ -19,12 +33,14 @@ const FLUSH_EVERY_MS = Number(process.env.GDELT_FLUSH_EVERY_MS) || 4000;
 const PROGRESS_EVERY_LINES =
   Number(process.env.GDELT_PROGRESS_EVERY_LINES) || 50000;
 
+// Enrichment = fetch article HTML head to get better title/summary/publisher/publish time
 const ENRICH_PREVIEW = (process.env.GDELT_ENRICH_PREVIEW || "1") !== "0";
 const ENRICH_MAX = Number(process.env.GDELT_ENRICH_MAX) || 120;
 const ENRICH_CONCURRENCY = Number(process.env.GDELT_ENRICH_CONCURRENCY) || 6;
 const ENRICH_TIMEOUT_MS = Number(process.env.GDELT_ENRICH_TIMEOUT_MS) || 5500;
 const ENRICH_MAX_BYTES = Number(process.env.GDELT_ENRICH_MAX_BYTES) || 350_000;
 
+// Domain blockers (noise)
 const BLOCKED_DOMAIN_SUBSTRINGS = [
   "tmz.com",
   "people.com",
@@ -155,6 +171,7 @@ function pickGeo(cols) {
   return best;
 }
 
+// Small deterministic jitter to avoid perfect stacking
 function microJitter(lon, lat, seed, mag = 0.12) {
   let h = 0x811c9dc5;
   const s = String(seed || "");
@@ -179,6 +196,7 @@ function nicePlaceName(raw) {
   return s || "Unknown location";
 }
 
+// GDELT DATEADDED is YYYYMMDDHHMMSS (UTC)
 function parseDateAdded(dateAdded, fallback) {
   if (!dateAdded || !/^\d{14}$/.test(dateAdded)) return fallback;
   const Y = dateAdded.slice(0, 4);
@@ -190,6 +208,8 @@ function parseDateAdded(dateAdded, fallback) {
   const d = new Date(`${Y}-${M}-${D}T${h}:${m}:${s}Z`);
   return Number.isNaN(d.getTime()) ? fallback : d;
 }
+
+/* ------------------- hazard detection ------------------- */
 
 const HAZARD_PATTERNS = [
   { label: "Flood", re: /\b(flood|flooding|flash flood|inundat|storm surge|levee|dam burst)\b/i },
@@ -215,6 +235,7 @@ const DAMAGE_PATTERN =
 const CONTEXT_RE =
   /\b(rain|storm|flood|wind|hail|lightning|snow|ice|earthquake|wildfire|mudslide|landslide|tsunami|volcano|heat|drought|hurricane|typhoon|cyclone|atmospheric river)\b/i;
 
+// Disaster-ish event codes (keep as heuristic)
 const HAZARD_EVENTCODES = new Set(["102", "103", "190", "191", "193", "194", "195"]);
 
 function detectHazardFromText(t) {
@@ -243,6 +264,8 @@ function classifyHazard({ actor1, actor2, place, url, domain, eventCode }) {
 
   return null;
 }
+
+/* ------------------- HTML helpers (enrichment) ------------------- */
 
 function decodeHtml(s) {
   return String(s || "")
@@ -279,7 +302,7 @@ function extractFromMetaTags(head, wantedKeys) {
     if (!wantedKeys.has(key)) continue;
     const content = attrs.content || "";
     if (!content) continue;
-    if (!out[key]) out[key] = sanitizeText(content, 500);
+    if (!out[key]) out[key] = sanitizeText(content, 800);
   }
   return out;
 }
@@ -287,6 +310,127 @@ function extractFromMetaTags(head, wantedKeys) {
 function extractTitleTag(head) {
   const m = head.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   return m ? sanitizeText(m[1], 180) : "";
+}
+
+function parseDateStringLoose(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+
+  // Epoch seconds/millis in some tags
+  if (/^\d{10}$/.test(s)) {
+    const d = new Date(Number(s) * 1000);
+    return Number.isNaN(d.getTime()) ? null : { date: d, precision: "datetime" };
+  }
+  if (/^\d{13}$/.test(s)) {
+    const d = new Date(Number(s));
+    return Number.isNaN(d.getTime()) ? null : { date: d, precision: "datetime" };
+  }
+
+  // Date-only: YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const d = new Date(`${s}T00:00:00Z`);
+    return Number.isNaN(d.getTime()) ? null : { date: d, precision: "date" };
+  }
+
+  // Datetime without timezone "YYYY-MM-DD HH:MM(:SS)"
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(s)) {
+    const isoish = s.replace(" ", "T") + "Z";
+    const d = new Date(isoish);
+    return Number.isNaN(d.getTime()) ? null : { date: d, precision: "datetime" };
+  }
+
+  // ISO / RFC formats
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return { date: d, precision: "datetime" };
+
+  return null;
+}
+
+function tryParsePublishedAtFromJsonLd(head) {
+  try {
+    const re = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+    const matches = [...head.matchAll(re)];
+    for (const m of matches) {
+      const raw = (m[1] || "")
+        .replace(/^\s*<!--/, "")
+        .replace(/-->\s*$/, "")
+        .trim();
+      if (!raw) continue;
+
+      let json;
+      try {
+        json = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+
+      const stack = [json];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (!cur) continue;
+
+        if (Array.isArray(cur)) {
+          for (const x of cur) stack.push(x);
+          continue;
+        }
+
+        if (typeof cur === "object") {
+          const candidates = [
+            cur.datePublished,
+            cur.dateCreated,
+            cur.dateModified,
+            cur.uploadDate,
+            cur.published,
+          ].filter(Boolean);
+
+          for (const c of candidates) {
+            const parsed = parseDateStringLoose(c);
+            if (parsed?.date) return { ...parsed, source: "jsonld" };
+          }
+
+          for (const v of Object.values(cur)) {
+            if (v && (typeof v === "object" || Array.isArray(v))) stack.push(v);
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function tryParsePublishedAtFromMeta(meta, head) {
+  // Priority order matters
+  const keys = [
+    "article:published_time",
+    "og:published_time",
+    "og:pubdate",
+    "pubdate",
+    "publishdate",
+    "publish-date",
+    "datepublished",
+    "dc.date.issued",
+    "dc.date",
+    "dcterms.issued",
+    "dcterms.created",
+    "parsely-pub-date",
+    "sailthru.date",
+    "timestamp",
+  ];
+
+  for (const k of keys) {
+    const v = meta[k];
+    if (!v) continue;
+    const parsed = parseDateStringLoose(v);
+    if (parsed?.date) return { ...parsed, source: `meta:${k}` };
+  }
+
+  // Try JSON-LD if meta didn’t work
+  const jsonld = tryParsePublishedAtFromJsonLd(head);
+  if (jsonld?.date) return jsonld;
+
+  return null;
 }
 
 async function fetchPreview(url) {
@@ -317,6 +461,22 @@ async function fetchPreview(url) {
       "application-name",
       "og:image",
       "twitter:image",
+
+      // publish time candidates
+      "article:published_time",
+      "og:published_time",
+      "og:pubdate",
+      "pubdate",
+      "publishdate",
+      "publish-date",
+      "datepublished",
+      "dc.date.issued",
+      "dc.date",
+      "dcterms.issued",
+      "dcterms.created",
+      "parsely-pub-date",
+      "sailthru.date",
+      "timestamp",
     ]);
 
     const meta = extractFromMetaTags(head, wanted);
@@ -325,17 +485,24 @@ async function fetchPreview(url) {
       meta["og:title"] || meta["twitter:title"] || extractTitleTag(head);
 
     const summary =
-      meta["og:description"] || meta["twitter:description"] || meta["description"];
+      meta["og:description"] ||
+      meta["twitter:description"] ||
+      meta["description"];
 
     const siteName = meta["og:site_name"] || meta["application-name"] || "";
-
     const image = meta["og:image"] || meta["twitter:image"] || "";
 
+    const publishedHit = tryParsePublishedAtFromMeta(meta, head);
+
     return {
-      headline: sanitizeText(headline, 160),
-      summary: sanitizeText(summary, 260),
-      siteName: sanitizeText(siteName, 60),
-      image: sanitizeText(image, 400),
+      headline: sanitizeText(headline, 180),
+      summary: sanitizeText(summary, 700), // longer summary for in-app reading
+      siteName: sanitizeText(siteName, 80),
+      image: sanitizeText(image, 500),
+
+      publishedAt: publishedHit?.date || null,
+      publishedAtSource: publishedHit?.source || null,
+      publishedAtPrecision: publishedHit?.precision || null,
     };
   } catch {
     return null;
@@ -344,7 +511,7 @@ async function fetchPreview(url) {
 
 function buildSourceLine(siteName, domain) {
   const base = "News report";
-  const s = sanitizeText(siteName, 60);
+  const s = sanitizeText(siteName, 80);
   if (s) return `${base} • ${s}`;
   if (domain) return `${base} • ${domain}`;
   return base;
@@ -357,7 +524,7 @@ async function enrichDocs(col, items) {
   let totalOps = 0;
   let bulk = [];
 
-  async function flush(reason) {
+  async function flush() {
     if (!bulk.length) return;
     const ops = bulk.length;
     try {
@@ -386,11 +553,13 @@ async function enrichDocs(col, items) {
         updatedAt: now,
       };
 
+      // Prefer enriched headline/summary if available
       if (preview?.headline) updates.title = preview.headline;
 
       if (preview?.summary) {
         updates.description = preview.summary;
       } else {
+        // Keep your fallback short (UI can show more when we have it)
         updates.description = `${item.hazardLabel} reported near ${nicePlaceName(
           item.place
         )}.`;
@@ -399,6 +568,13 @@ async function enrichDocs(col, items) {
       if (siteName) updates.publisherName = siteName;
       if (preview?.image) updates.image = preview.image;
 
+      // ✅ IMPORTANT: Update publishedAt for UI timestamp (does NOT affect TTL)
+      if (preview?.publishedAt instanceof Date && !Number.isNaN(preview.publishedAt.getTime())) {
+        updates.publishedAt = preview.publishedAt;
+        updates.publishedAtSource = preview.publishedAtSource || "preview";
+        updates.publishedAtPrecision = preview.publishedAtPrecision || "datetime";
+      }
+
       bulk.push({
         updateOne: {
           filter: { url: item.url },
@@ -406,7 +582,7 @@ async function enrichDocs(col, items) {
         },
       });
 
-      if (bulk.length >= 200) await flush("batch");
+      if (bulk.length >= 200) await flush();
     }
   }
 
@@ -415,7 +591,7 @@ async function enrichDocs(col, items) {
     () => worker()
   );
   await Promise.all(workers);
-  await flush("final");
+  await flush();
 
   return totalOps;
 }
@@ -471,14 +647,15 @@ export async function pollGDELT() {
     const db = getDB();
     const col = db.collection("social_signals");
 
-    const now = new Date();
-    await col.deleteMany({ ingest: "GDELT", expires: { $lte: now } });
+    // Cleanup expired GDELT docs
+    const now0 = new Date();
+    await col.deleteMany({ ingest: "GDELT", expires: { $lte: now0 } });
 
     let bulk = [];
     let lastFlushAt = Date.now();
     const toEnrich = [];
 
-    async function flushBulk(reason) {
+    async function flushBulk() {
       if (!bulk.length) return;
       const ops = bulk.length;
       try {
@@ -528,13 +705,13 @@ export async function pollGDELT() {
         domain,
         eventCode,
       });
-
       if (!hazardLabel) continue;
 
       const now = new Date();
       const dateAdded = cols[IDX.DATEADDED];
-      const publishedAt = parseDateAdded(dateAdded, now);
-      const expires = new Date(Date.now() + TTL_MS);
+
+      // Fallback publish time if we can't extract from the article
+      const gdeltPublishedAt = parseDateAdded(dateAdded, now);
 
       const [jLon, jLat] = microJitter(
         geo.lon,
@@ -548,22 +725,17 @@ export async function pollGDELT() {
 
       const sourceLine = buildSourceLine("", domain);
 
-      const doc = {
+      // Fields we ALWAYS refresh (geo + gdelt metadata)
+      const setFields = {
         type: "news",
-        source: sourceLine,
-        provider: null,
+        provider: "GDELT",
         ingest: "GDELT",
 
         hazardLabel,
         domain,
         url,
 
-        title: baseTitle,
-        description: baseDesc,
-
-        publishedAt,
         updatedAt: now,
-        expires,
 
         geometry: { type: "Point", coordinates: [jLon, jLat] },
         lat: jLat,
@@ -587,10 +759,26 @@ export async function pollGDELT() {
         },
       };
 
+      // Fields set ONLY on insert (preserve enriched title/summary + preserve TTL)
+      const setOnInsertFields = {
+        createdAt: now,
+        expires: new Date(now.getTime() + TTL_MS), // ✅ TTL from ingestion only
+        source: sourceLine,
+
+        // Start with a reasonable baseline; enrichment can overwrite later
+        title: baseTitle,
+        description: baseDesc,
+
+        // UI timestamp baseline; enrichment may overwrite with true publisher time
+        publishedAt: gdeltPublishedAt,
+        publishedAtSource: "gdelt:dateAdded",
+        publishedAtPrecision: "datetime",
+      };
+
       bulk.push({
         updateOne: {
           filter: { url },
-          update: { $set: doc, $setOnInsert: { createdAt: now } },
+          update: { $set: setFields, $setOnInsert: setOnInsertFields },
           upsert: true,
         },
       });
@@ -602,15 +790,15 @@ export async function pollGDELT() {
       saved++;
 
       if (bulk.length >= BATCH_SIZE) {
-        await flushBulk("batch");
+        await flushBulk();
       } else if (Date.now() - lastFlushAt > FLUSH_EVERY_MS) {
-        await flushBulk("timer");
+        await flushBulk();
       }
 
       if (saved >= MAX_SAVE) break;
     }
 
-    await flushBulk("final");
+    await flushBulk();
 
     if (ENRICH_PREVIEW && toEnrich.length) {
       enrichedOps = await enrichDocs(col, toEnrich);
