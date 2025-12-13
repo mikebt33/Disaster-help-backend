@@ -12,14 +12,14 @@ const router = express.Router();
  */
 router.post("/", async (req, res) => {
   try {
-    const { user_id, type, types, message, details, lat, lng } = req.body;
+    const { user_id, type, types, message, details, lat, lng, region } = req.body;
     if (!lat || !lng)
       return res.status(400).json({ error: "Latitude and longitude required." });
 
     const db = getDB();
     const coll = db.collection("offer_help");
 
-    // ✅ Normalize types
+    // Normalize types
     const allTypes = Array.isArray(types)
       ? types
       : type
@@ -45,12 +45,30 @@ router.post("/", async (req, res) => {
     const result = await coll.insertOne(doc);
     const inserted = { ...doc, _id: result.insertedId };
 
+    // 📦 Archive successful offer creation (pilot metrics)
+    try {
+      await db.collection("events_archive").insertOne({
+        type: "offer_help",
+        entityId: result.insertedId,
+        user_id: user_id || null,
+        region: region || "unknown",
+        status: "success",
+        timestamp: new Date(),
+      });
+    } catch (archiveErr) {
+      console.error(
+        "events_archive (offer_help) failed:",
+        archiveErr.message
+      );
+    }
+
     // ✅ Fire notifications asynchronously, excluding poster’s tokens
     setImmediate(async () => {
       try {
         const poster = doc.user_id
           ? await db.collection("users").findOne({ user_id: doc.user_id })
           : null;
+
         const excludeTokens = Array.isArray(poster?.fcm_tokens)
           ? poster.fcm_tokens
           : [];
@@ -69,6 +87,23 @@ router.post("/", async (req, res) => {
     res.status(201).json({ id: result.insertedId.toString(), ...doc });
   } catch (err) {
     console.error("POST /api/offers error:", err);
+
+    // ❌ Archive failed offer attempt
+    try {
+      const db = getDB();
+      await db.collection("events_archive").insertOne({
+        type: "offer_help",
+        status: "error",
+        errorMessage: err.message,
+        timestamp: new Date(),
+      });
+    } catch (archiveErr) {
+      console.error(
+        "events_archive (offer_help error) failed:",
+        archiveErr.message
+      );
+    }
+
     res.status(500).json({ error: "Internal server error." });
   }
 });
@@ -83,6 +118,7 @@ router.get("/", async (_req, res) => {
       .sort({ timestamp: -1 })
       .limit(100)
       .toArray();
+
     res.json(docs.map((d) => ({ ...d, _id: d._id.toString() })));
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -94,6 +130,7 @@ router.get("/near", async (req, res) => {
     const lat = parseFloat(req.query.lat);
     const lng = parseFloat(req.query.lng);
     const radiusKm = parseFloat(req.query.radius_km || 5);
+
     if (isNaN(lat) || isNaN(lng))
       return res.status(400).json({ error: "Valid lat/lng required." });
 
@@ -124,8 +161,10 @@ router.get("/:id", async (req, res) => {
     const query = /^[0-9a-fA-F]{24}$/.test(id)
       ? { _id: new ObjectId(id) }
       : { _id: id };
+
     const doc = await db.collection("offer_help").findOne(query);
     if (!doc) return res.status(404).json({ error: "Offer not found." });
+
     res.json({ ...doc, _id: doc._id.toString() });
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -144,6 +183,7 @@ router.patch("/:id/confirm", async (req, res) => {
     const query = /^[0-9a-fA-F]{24}$/.test(id)
       ? { _id: new ObjectId(id) }
       : { _id: id };
+
     const coll = db.collection("offer_help");
     const doc = await coll.findOne(query);
     if (!doc) return res.status(404).json({ error: "Not found." });
@@ -160,6 +200,7 @@ router.patch("/:id/confirm", async (req, res) => {
     } else update.$inc.confirmCount = 1;
 
     await coll.updateOne(query, update);
+
     setImmediate(() =>
       notifyFollowersOfUpdate(
         "offer_help",
@@ -169,6 +210,7 @@ router.patch("/:id/confirm", async (req, res) => {
         "An offer was confirmed."
       )
     );
+
     res.json({ message: "Confirm recorded." });
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -186,6 +228,7 @@ router.patch("/:id/dispute", async (req, res) => {
     const query = /^[0-9a-fA-F]{24}$/.test(id)
       ? { _id: new ObjectId(id) }
       : { _id: id };
+
     const coll = db.collection("offer_help");
     const doc = await coll.findOne(query);
     if (!doc) return res.status(404).json({ error: "Not found." });
@@ -202,6 +245,7 @@ router.patch("/:id/dispute", async (req, res) => {
     } else update.$inc.disputeCount = 1;
 
     await coll.updateOne(query, update);
+
     setImmediate(() =>
       notifyFollowersOfUpdate(
         "offer_help",
@@ -211,6 +255,7 @@ router.patch("/:id/dispute", async (req, res) => {
         "An offer was disputed."
       )
     );
+
     res.json({ message: "Dispute recorded." });
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -224,12 +269,15 @@ router.patch("/:id/resolve", async (req, res) => {
     const query = /^[0-9a-fA-F]{24}$/.test(id)
       ? { _id: new ObjectId(id) }
       : { _id: id };
+
     const coll = db.collection("offer_help");
     const r = await coll.updateOne(query, {
       $set: { resolved: true, resolvedAt: new Date() },
     });
+
     if (!r.matchedCount)
       return res.status(404).json({ error: "Not found." });
+
     setImmediate(() =>
       notifyFollowersOfUpdate(
         "offer_help",
@@ -239,13 +287,14 @@ router.patch("/:id/resolve", async (req, res) => {
         "A followed offer was resolved."
       )
     );
+
     res.json({ message: "Offer resolved." });
   } catch {
     res.status(500).json({ error: "Internal server error." });
   }
 });
 
-/** follow / comments / delete **/
+/** follow **/
 router.patch("/:id/follow", async (req, res) => {
   try {
     const { user_id } = req.body;
@@ -257,6 +306,7 @@ router.patch("/:id/follow", async (req, res) => {
     const query = /^[0-9a-fA-F]{24}$/.test(id)
       ? { _id: new ObjectId(id) }
       : { _id: id };
+
     const coll = db.collection("offer_help");
     const doc = await coll.findOne(query);
     if (!doc) return res.status(404).json({ error: "Not found." });
@@ -289,9 +339,10 @@ router.patch("/:id/follow", async (req, res) => {
   }
 });
 
+/** comments **/
 router.post("/:id/comments", async (req, res) => {
   try {
-    const { user_id, text } = req.body;
+    const { user_id, text, region } = req.body;
     if (!text)
       return res.status(400).json({ error: "Comment text required." });
 
@@ -300,6 +351,7 @@ router.post("/:id/comments", async (req, res) => {
     const query = /^[0-9a-fA-F]{24}$/.test(id)
       ? { _id: new ObjectId(id) }
       : { _id: id };
+
     const coll = db.collection("offer_help");
     const comments = db.collection("offer_comments");
     const offerDoc = await coll.findOne(query);
@@ -311,11 +363,30 @@ router.post("/:id/comments", async (req, res) => {
       text,
       createdAt: new Date(),
     };
+
     const result = await comments.insertOne(comment);
+
+    // 💬 Archive offer comment
+    try {
+      await db.collection("comments_archive").insertOne({
+        parentType: "offer_help",
+        parentId: offerDoc._id,
+        user_id: user_id || null,
+        region: region || "unknown",
+        text,
+        timestamp: new Date(),
+      });
+    } catch (archiveErr) {
+      console.error(
+        "comments_archive (offer_help) failed:",
+        archiveErr.message
+      );
+    }
 
     setImmediate(() =>
       notifyFollowersOfUpdate("offer_help", id, user_id, "comment", text)
     );
+
     res.status(201).json({ id: result.insertedId.toString(), ...comment });
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -329,11 +400,13 @@ router.get("/:id/comments", async (req, res) => {
     const filter = /^[0-9a-fA-F]{24}$/.test(id)
       ? { offer_id: new ObjectId(id) }
       : { offer_id: id };
+
     const docs = await db
       .collection("offer_comments")
       .find(filter)
       .sort({ createdAt: 1 })
       .toArray();
+
     res.json(docs.map((c) => ({ ...c, _id: c._id.toString() })));
   } catch {
     res.status(500).json({ error: "Internal server error." });
@@ -347,9 +420,11 @@ router.delete("/:id", async (req, res) => {
     const query = /^[0-9a-fA-F]{24}$/.test(id)
       ? { _id: new ObjectId(id) }
       : { _id: id };
+
     const r = await db.collection("offer_help").deleteOne(query);
     if (!r.deletedCount)
       return res.status(404).json({ error: "Not found." });
+
     res.json({ message: "Offer deleted." });
   } catch {
     res.status(500).json({ error: "Internal server error." });
