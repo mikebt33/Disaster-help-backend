@@ -8,7 +8,7 @@
 //   - Best: meta/JSON-LD publish timestamps from the article HTML head
 //
 // Output docs in: social_signals
-// { type:"news", provider:"GDELT", source:"News report • ...", title, description,
+// { type:"news", provider:"GDELT", source:"News report • ...", title, description, summary,
 //   publishedAt, publishedAtSource, publishedAtPrecision, createdAt, updatedAt,
 //   expires, geometry:{Point}, hazardLabel, url, domain, ... }
 
@@ -212,13 +212,28 @@ function parseDateAdded(dateAdded, fallback) {
 /* ------------------- hazard detection ------------------- */
 
 const HAZARD_PATTERNS = [
-  { label: "Flood", re: /\b(flood|flooding|flash flood|inundat|storm surge|levee|dam burst)\b/i },
+  {
+    label: "Flood",
+    re: /\b(flood|flooding|flash flood|inundat|storm surge|levee|dam burst)\b/i,
+  },
   { label: "Tornado", re: /\b(tornado|twister|waterspout)\b/i },
-  { label: "Hurricane / Tropical", re: /\b(hurricane|tropical storm|cyclone|typhoon)\b/i },
-  { label: "Severe storm", re: /\b(thunderstorm|severe storm|hail|microburst|downburst)\b/i },
-  { label: "High wind", re: /\b(high winds?|strong winds?|damaging winds?|windstorm|gusty)\b/i },
+  {
+    label: "Hurricane / Tropical",
+    re: /\b(hurricane|tropical storm|cyclone|typhoon)\b/i,
+  },
+  {
+    label: "Severe storm",
+    re: /\b(thunderstorm|severe storm|hail|microburst|downburst)\b/i,
+  },
+  {
+    label: "High wind",
+    re: /\b(high winds?|strong winds?|damaging winds?|windstorm|gusty)\b/i,
+  },
   { label: "Winter storm", re: /\b(blizzard|winter storm|snowstorm|whiteout|ice storm)\b/i },
-  { label: "Wildfire", re: /\b(wild ?fire|forest fire|brush fire|grass fire|bushfire)\b/i },
+  {
+    label: "Wildfire",
+    re: /\b(wild ?fire|forest fire|brush fire|grass fire|bushfire)\b/i,
+  },
   { label: "Earthquake", re: /\b(earthquake|aftershock|seismic)\b/i },
   { label: "Tsunami", re: /\b(tsunami)\b/i },
   { label: "Volcano", re: /\b(volcano|lava|eruption|ash plume)\b/i },
@@ -348,7 +363,8 @@ function parseDateStringLoose(raw) {
 
 function tryParsePublishedAtFromJsonLd(head) {
   try {
-    const re = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+    const re =
+      /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
     const matches = [...head.matchAll(re)];
     for (const m of matches) {
       const raw = (m[1] || "")
@@ -433,9 +449,10 @@ function tryParsePublishedAtFromMeta(meta, head) {
   return null;
 }
 
-async function fetchPreview(url) {
+async function fetchPreview(url, signal) {
   try {
     const resp = await axios.get(url, {
+      signal,
       timeout: ENRICH_TIMEOUT_MS,
       responseType: "text",
       maxRedirects: 5,
@@ -481,13 +498,10 @@ async function fetchPreview(url) {
 
     const meta = extractFromMetaTags(head, wanted);
 
-    const headline =
-      meta["og:title"] || meta["twitter:title"] || extractTitleTag(head);
+    const headline = meta["og:title"] || meta["twitter:title"] || extractTitleTag(head);
 
     const summary =
-      meta["og:description"] ||
-      meta["twitter:description"] ||
-      meta["description"];
+      meta["og:description"] || meta["twitter:description"] || meta["description"];
 
     const siteName = meta["og:site_name"] || meta["application-name"] || "";
     const image = meta["og:image"] || meta["twitter:image"] || "";
@@ -517,9 +531,21 @@ function buildSourceLine(siteName, domain) {
   return base;
 }
 
-let GDELT_RUNNING = false;
+/* ------------------- robust concurrency guard ------------------- */
 
-async function enrichDocs(col, items) {
+let GDELT_RUNNING = false;
+let GDELT_RUNNING_SINCE_MS = 0;
+
+// If a run hangs and never clears the lock, we allow a stale-lock override.
+// This should be > MAX_RUNTIME_MS to avoid false overrides.
+const STALE_LOCK_MS = MAX_RUNTIME_MS + 90_000;
+
+function lockAgeSec() {
+  if (!GDELT_RUNNING || !GDELT_RUNNING_SINCE_MS) return 0;
+  return Math.max(0, Math.round((Date.now() - GDELT_RUNNING_SINCE_MS) / 1000));
+}
+
+async function enrichDocs(col, items, signal) {
   const queue = items.slice();
   let totalOps = 0;
   let bulk = [];
@@ -542,7 +568,7 @@ async function enrichDocs(col, items) {
       const item = queue.pop();
       if (!item) return;
 
-      const preview = await fetchPreview(item.url);
+      const preview = await fetchPreview(item.url, signal);
 
       const now = new Date();
       const siteName = preview?.siteName || "";
@@ -557,12 +583,13 @@ async function enrichDocs(col, items) {
       if (preview?.headline) updates.title = preview.headline;
 
       if (preview?.summary) {
+        // ✅ write into BOTH fields so your UI can use either
         updates.description = preview.summary;
+        updates.summary = preview.summary;
       } else {
-        // Keep your fallback short (UI can show more when we have it)
-        updates.description = `${item.hazardLabel} reported near ${nicePlaceName(
-          item.place
-        )}.`;
+        const fallback = `${item.hazardLabel} reported near ${nicePlaceName(item.place)}.`;
+        updates.description = fallback;
+        updates.summary = fallback;
       }
 
       if (siteName) updates.publisherName = siteName;
@@ -586,10 +613,7 @@ async function enrichDocs(col, items) {
     }
   }
 
-  const workers = Array.from(
-    { length: Math.max(1, ENRICH_CONCURRENCY) },
-    () => worker()
-  );
+  const workers = Array.from({ length: Math.max(1, ENRICH_CONCURRENCY) }, () => worker());
   await Promise.all(workers);
   await flush();
 
@@ -597,14 +621,38 @@ async function enrichDocs(col, items) {
 }
 
 export async function pollGDELT() {
+  // --- lock gate (with stale override) ---
   if (GDELT_RUNNING) {
-    console.log("⏭️ GDELT skipped (previous run still in progress)");
-    return;
+    const age = Date.now() - (GDELT_RUNNING_SINCE_MS || 0);
+    if (age > STALE_LOCK_MS) {
+      console.warn(
+        `⚠️ GDELT lock stale (age=${Math.round(age / 1000)}s > ${Math.round(
+          STALE_LOCK_MS / 1000
+        )}s). Forcing unlock and starting a fresh run.`
+      );
+      GDELT_RUNNING = false;
+      GDELT_RUNNING_SINCE_MS = 0;
+    } else {
+      console.log(
+        `⏭️ GDELT skipped (previous run still in progress; lockAgeSec=${lockAgeSec()})`
+      );
+      return;
+    }
   }
+
   GDELT_RUNNING = true;
+  GDELT_RUNNING_SINCE_MS = Date.now();
+
+  const runId = `${new Date().toISOString()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const startedAt = Date.now();
   const deadline = startedAt + MAX_RUNTIME_MS;
+
+  // We use AbortController so the watchdog can hard-stop network + enrichment.
+  const ac = new AbortController();
+  const signal = ac.signal;
+
+  let watchdog = null;
 
   let zipStream = null;
   let csvStream = null;
@@ -615,8 +663,30 @@ export async function pollGDELT() {
   let flushed = 0;
   let enrichedOps = 0;
 
+  const safe = (fn) => {
+    try {
+      fn();
+    } catch {}
+  };
+
+  const forceStop = (why) => {
+    console.warn(`⚠️ [GDELT] forceStop: ${why} (runId=${runId})`);
+    safe(() => ac.abort(new Error(String(why || "GDELT aborted"))));
+    safe(() => rl?.close());
+    safe(() => csvStream?.destroy(new Error(String(why || "GDELT aborted"))));
+    safe(() => zipStream?.destroy(new Error(String(why || "GDELT aborted"))));
+  };
+
   try {
+    console.log(`🌎 GDELT Poller running… runId=${runId}`);
+
+    // --- watchdog: fixes "stuck forever" when stream stalls ---
+    watchdog = setTimeout(() => {
+      forceStop(`watchdog timeout after ${MAX_RUNTIME_MS}ms`);
+    }, MAX_RUNTIME_MS + 15_000);
+
     const { data: lastTxt } = await axios.get(LASTUPDATE_URL, {
+      signal,
       timeout: 15000,
       responseType: "text",
       headers: { "User-Agent": USER_AGENT },
@@ -634,20 +704,34 @@ export async function pollGDELT() {
     const originalUrl = line.trim().split(/\s+/).pop();
     const zipUrl = rewriteGdeltUrl(originalUrl);
 
+    console.log(`⬇️ GDELT ZIP URL: ${zipUrl}`);
+    console.log("📄 Parsing GDELT Events CSV…");
+
     const zipResp = await axios.get(zipUrl, {
+      signal,
       responseType: "stream",
       timeout: 60000,
       headers: { "User-Agent": USER_AGENT },
     });
 
     zipStream = zipResp.data;
+    // If unzipper/stream errors, ensure we surface them
+    zipStream.on?.("error", (e) =>
+      console.warn(`⚠️ [GDELT] zipStream error: ${e?.message || e}`)
+    );
+
     csvStream = zipStream.pipe(unzipper.ParseOne(/\.csv$/i));
+    csvStream.on?.("error", (e) =>
+      console.warn(`⚠️ [GDELT] csvStream error: ${e?.message || e}`)
+    );
+
     rl = readline.createInterface({ input: csvStream, crlfDelay: Infinity });
 
     const db = getDB();
+    console.log(`🧪 GDELT using DB: ${db?.databaseName || "(unknown)"}`);
     const col = db.collection("social_signals");
 
-    // Cleanup expired GDELT docs
+    // Optional: proactively delete expired docs (TTL index will also handle this)
     const now0 = new Date();
     await col.deleteMany({ ingest: "GDELT", expires: { $lte: now0 } });
 
@@ -670,13 +754,16 @@ export async function pollGDELT() {
     }
 
     for await (const line of rl) {
-      if (Date.now() > deadline) break;
+      if (Date.now() > deadline) {
+        console.warn(`⚠️ [GDELT] deadline reached; stopping read loop (runId=${runId})`);
+        break;
+      }
       if (!line) continue;
 
       scanned++;
       if (scanned % PROGRESS_EVERY_LINES === 0) {
         console.log(
-          `…GDELT progress scanned=${scanned} saved=${saved} flushed=${flushed}`
+          `…GDELT progress runId=${runId} scanned=${scanned} saved=${saved} flushed=${flushed}`
         );
       }
 
@@ -768,6 +855,7 @@ export async function pollGDELT() {
         // Start with a reasonable baseline; enrichment can overwrite later
         title: baseTitle,
         description: baseDesc,
+        summary: baseDesc, // ✅ ensure quicksheet can show more than a title
 
         // UI timestamp baseline; enrichment may overwrite with true publisher time
         publishedAt: gdeltPublishedAt,
@@ -801,25 +889,27 @@ export async function pollGDELT() {
     await flushBulk();
 
     if (ENRICH_PREVIEW && toEnrich.length) {
-      enrichedOps = await enrichDocs(col, toEnrich);
+      enrichedOps = await enrichDocs(col, toEnrich, signal);
     }
 
     const runtimeSec = Math.round((Date.now() - startedAt) / 1000);
     console.log(
-      `✅ GDELT done scanned=${scanned} saved=${saved} enrichedOps=${enrichedOps} runtimeSec=${runtimeSec}`
+      `✅ GDELT done runId=${runId} scanned=${scanned} saved=${saved} enrichedOps=${enrichedOps} runtimeSec=${runtimeSec}`
     );
   } catch (err) {
-    console.error("❌ GDELT ERROR:", err?.message || err);
+    console.error(`❌ GDELT ERROR runId=${runId}:`, err?.message || err);
   } finally {
+    if (watchdog) clearTimeout(watchdog);
+
+    // Always release lock
     GDELT_RUNNING = false;
-    try {
-      rl?.close();
-    } catch {}
-    try {
-      csvStream?.destroy();
-    } catch {}
-    try {
-      zipStream?.destroy();
-    } catch {}
+    GDELT_RUNNING_SINCE_MS = 0;
+
+    // Always attempt to close/destroy resources
+    safe(() => rl?.close());
+    safe(() => csvStream?.destroy());
+    safe(() => zipStream?.destroy());
+
+    console.log(`🔓 GDELT lock released runId=${runId}`);
   }
 }
